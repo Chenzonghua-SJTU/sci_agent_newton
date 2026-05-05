@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-scientist-sandbox"
+version = "0.1.0"
+description = "An autonomous neuro-symbolic scientist agent for discovering hidden physical laws in a virtual universe."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "OpenAI Codex Collaboration" }
+]
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.26,<3.0",
+  "scipy>=1.11,<2.0",
+  "pandas>=2.1,<3.0",
+  "matplotlib>=3.8,<4.0",
+  "scikit-learn>=1.3,<1.7",
+  "pysr>=0.19,<1.0",
+  "openai>=1.30,<2.0",
+  "python-dotenv>=1.0,<2.0",
+]
+keywords = [
+  "ai4s",
+  "autonomous-agent",
+  "symbolic-regression",
+  "pysr",
+  "openai",
+  "physics-discovery",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["autonomous_scientist*"]
