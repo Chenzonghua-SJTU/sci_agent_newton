@@ -162,6 +162,61 @@ class DataProcessingTool:
 
         return differentiated
 
+    def estimate_kinematics(
+        self,
+        t: np.ndarray,
+        q: np.ndarray,
+        window_length: int | None = None,
+        polyorder: int | None = None,
+    ) -> dict[str, np.ndarray]:
+        """从位置序列同时估计平滑位置、速度和加速度。
+
+        这里使用 Savitzky-Golay 的导数形式在同一个局部多项式窗口内
+        估计 0/1/2 阶导数，避免先差分再差分带来的误差累积。
+        """
+        t_array = np.asarray(t, dtype=float)
+        q_array = np.asarray(q, dtype=float)
+        self._validate_inputs(t=t_array, values=q_array)
+        dt = self._infer_uniform_dt(t_array)
+
+        effective_window = self._resolve_window_length(
+            target_length=len(q_array),
+            preferred_window=window_length or self.window_length,
+        )
+        effective_polyorder = min(polyorder or self.polyorder, effective_window - 1)
+        if effective_polyorder < 2:
+            raise ValueError("估计二阶导数时 polyorder 至少需要为 2。")
+
+        q_smooth = savgol_filter(
+            q_array,
+            window_length=effective_window,
+            polyorder=effective_polyorder,
+            deriv=0,
+            delta=dt,
+            mode="interp",
+        )
+        v_estimate = savgol_filter(
+            q_array,
+            window_length=effective_window,
+            polyorder=effective_polyorder,
+            deriv=1,
+            delta=dt,
+            mode="interp",
+        )
+        a_estimate = savgol_filter(
+            q_array,
+            window_length=effective_window,
+            polyorder=effective_polyorder,
+            deriv=2,
+            delta=dt,
+            mode="interp",
+        )
+        return {
+            "q_smooth": q_smooth,
+            "v": v_estimate,
+            "a": a_estimate,
+        }
+
     def summarize_series(self, t: np.ndarray, values: np.ndarray, name: str) -> SeriesSummary:
         """为单个序列生成简洁统计摘要。"""
         t_array = np.asarray(t, dtype=float)

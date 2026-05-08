@@ -135,12 +135,12 @@ def main() -> int:
 
         log(DIVIDER)
         log("🧪 实验任务：Agent 只能从时间-位置数据出发，自主决定下一步实验与分析动作")
-        log("🧠 LLM 将逐步规划：是否做新实验、是否平滑、是否求导、是否进行符号回归")
+        log("🧠 LLM 将逐步规划：是否做新实验、是否平滑、是否求导、是否主动提出候选公式")
         log("🔁 当出现候选规律后，Agent 会尝试在不同初速度/不同外力下做跨实验复验")
         log("📘 最终会输出一份包含动作历史、泛化验证和规律总结的 Markdown 科研报告")
         log(DIVIDER)
 
-        max_steps = int(os.getenv("MAX_AGENT_STEPS", "20"))
+        max_steps = int(os.getenv("MAX_AGENT_STEPS", "30"))
         cycle_result = agent.run_scientific_cycle(
             max_steps=max_steps,
             progress_callback=log_agent_step,

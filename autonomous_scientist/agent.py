@@ -151,6 +151,13 @@ class ScientificNotebook:
             )
         )
 
+    def add_candidate_law(self, candidate: CandidateLaw) -> None:
+        self.candidate_laws.append(candidate)
+        self.notes.append(
+            f"实验 {candidate.source_experiment_id}: 新增候选规律 `{candidate.expression}`，"
+            f"origin={candidate.origin}，score={candidate.score:.12f}。{candidate.notes}"
+        )
+
     def add_generalization_check(self, check: GeneralizationCheck) -> None:
         self.generalization_checks.append(check)
         self.notes.append(check.summary_text)
@@ -302,21 +309,29 @@ class HypothesisBrain:
 你可用的动作只有：
 1. run_experiment
 2. smooth_series
-3. differentiate_series
-4. inspect_series
-5. test_candidate_expression
-6. search_invariants
-7. cross_experiment_check
-8. rank_candidate_laws
-9. finalize_law
+3. estimate_kinematics
+4. differentiate_series
+5. inspect_series
+6. inspect_relationships
+7. define_derived_quantity
+8. fit_relationship_model
+9. propose_candidate_expression
+10. test_candidate_expression
+11. cross_experiment_check
+12. rank_candidate_laws
+13. finalize_law
 
 动作说明：
 - run_experiment: 做一个新实验。参数可包含 initial_q, initial_v, force_field_type, constant_force, t_end, dt, noise_std。force_field_type 可用 free/none/no_force 或 constant/constant_force。
-- smooth_series: 对某个已有序列平滑。参数包含 experiment_id, source_series, output_name。
-- differentiate_series: 对某个已有序列做一阶或二阶差分。参数包含 experiment_id, source_series, order, output_name, smooth_before, smooth_after。
+- smooth_series: 对某个已有序列平滑。参数包含 experiment_id, source_series, output_name, overwrite。
+- estimate_kinematics: 从位置序列一次性估计平滑位置、速度和加速度。参数包含 experiment_id, source_series, position_name, velocity_name, acceleration_name, window_length, polyorder, overwrite。它使用同一个局部多项式窗口估计导数，适合从 q(t) 构造 v/a。
+- differentiate_series: 对某个已有序列做一阶或二阶差分。参数包含 experiment_id, source_series, order, output_name, smooth_before, smooth_after, overwrite。
 - inspect_series: 查看一个或多个序列的统计。参数包含 experiment_id, series_names。
-- test_candidate_expression: 测试一个表达式是否近似常数。参数包含 experiment_id, expression, output_name。表达式可使用已有序列名以及 square(x), cube(x)。
-- search_invariants: 在单个实验内搜索近似不随时间变化的候选表达式。参数包含 experiment_id, feature_series, binary_operators, unary_operators。
+- inspect_relationships: 只查看两个序列之间的关系。参数包含 experiment_id, x_series, y_series。它会生成一张时间轨迹/散点关系图，并输出中性的观察摘要；不会使用外力、平方项拟合或多变量搜索。
+- define_derived_quantity: 定义一个新的可复用物理量。参数包含 experiment_id, symbol, expression, description, overwrite。symbol 是新物理量名称，expression 是构造公式，可使用已有序列名、实验控制量 F_ext 以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
+- fit_relationship_model: 对一个目标序列做由你指定基函数的最小二乘拟合。参数包含 experiment_id, target_series, basis_expressions, prediction_name, residual_name, include_intercept。basis_expressions 由你给出，例如已有序列、新定义物理量或由它们组成的表达式；工具只返回拟合系数和残差，不自动搜索公式。
+- propose_candidate_expression: 让 LLM 基于可用特征量主动提出一个候选表达式，然后由程序立即求值和评分。参数包含 experiment_id, feature_series, output_name, acceptance_threshold。表达式只能使用已有序列名、实验控制量 F_ext、数字常数、括号、+、-、*、/、square(x)、cube(x)、sqrt(x)、log(x)、exp(x)、sin(x)、cos(x)、abs(x)。
+- test_candidate_expression: 测试一个由你提出的表达式是否近似常数。参数包含 experiment_id, expression, output_name。表达式可使用已有序列名以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
 - cross_experiment_check: 在多个实验之间检查同一表达式的稳定性。参数包含 expression, experiment_ids, metric_name。metric_name 当前支持 relative_std、mean_value、force_residual。若要验证表达式是否等于外力，优先使用 force_residual。
 - rank_candidate_laws: 对已有候选规律做排序和比较。参数可为空。
 - finalize_law: 当你认为证据已经足够时，结束探索并进入定律总结。
@@ -324,12 +339,17 @@ class HypothesisBrain:
 规划要求：
 1. 如果还没有实验，先做一个简单基准实验，只观察位置-时间轨迹。
 2. 不要一开始就默认使用任何派生物理量；需要通过观察轨迹后，再决定是否构造变化率或其他序列。
-3. 若你决定做差分，请明确说明为什么需要一阶或二阶变化率。
-4. 如果某个解释只在单个实验里成立，不应立刻接受；优先尝试新的实验条件来复验。
-5. 在设计新实验时，尽量改变初始条件、控制参数或对照场景，以增加辨识力。
-6. 不要把“拟合某个控制参数的常数”当作发现定律；更好的做法是搜索单实验内近似恒定的候选量，然后再做跨实验验证。
-7. 若你认为已有证据支持某条规律，可选择 finalize_law，但前提是至少做过一次不变量搜索和一次跨实验验证。
-8. 总步数上限为 {max_steps}，因此动作要尽量高信息密度。
+3. 若你需要速度/加速度，优先用 estimate_kinematics 从 q(t) 同时估计 q_smooth/v/a；只有在特殊情况下才直接对已有序列差分。
+4. 在提出公式前，优先用 inspect_series 和 inspect_relationships 主动观察变量关系。inspect_relationships 每次只能比较两个序列，例如先看 v 与 a，再另起一步看新定义量与 a。
+5. 如果观察到某种组合可能有物理意义，可以先用 define_derived_quantity 给它命名，再用 inspect_relationships 观察这个新量和其他量的关系。
+6. 如果你想检验“某个目标是否可由若干自定义特征解释”，使用 fit_relationship_model，但基函数必须由你基于观察主动指定。
+7. 当你已经看到足够关系线索时，使用 propose_candidate_expression 自己提出公式；不要调用不变量搜索、符号回归、枚举搜索或 PySR。
+8. 如果某个解释只在单个实验里成立，不应立刻接受；优先尝试新的实验条件来复验。
+9. 在设计新实验时，尽量改变初始条件、控制参数或对照场景，以增加辨识力。
+10. 不要把“拟合某个控制参数的常数”当作发现定律；更好的做法是先由你基于证据提出候选量，然后再做跨实验验证。
+11. 若你认为已有证据支持某条规律，可选择 finalize_law，但前提是至少存在一条候选规律和一次跨实验验证。
+12. 如果 propose_candidate_expression 返回的候选被评价为波动大或残差大，应继续处理数据、定义新量或重新设计实验，不要把它当作规律。
+13. 总步数上限为 {max_steps}，因此动作要尽量高信息密度。
 
 请只返回 JSON：
 {{
@@ -380,6 +400,62 @@ class HypothesisBrain:
             next_steps=str(payload.get("next_steps", "建议继续做更多外力与初速度条件下的实验。")),
             raw_payload=payload,
         )
+
+    def propose_candidate_expression(
+        self,
+        notebook_summary: str,
+        experiment_context: str,
+        feature_summaries: list[str],
+        feature_series: list[str],
+    ) -> dict[str, Any]:
+        """让 LLM 基于已构造的特征量提出一个待验证表达式。"""
+        allowed_variables = ", ".join(f"`{name}`" for name in feature_series)
+        system_prompt = (
+            "你是一个物理公式提案器。你的任务不是验证公式，而是基于已有时间序列特征"
+            "提出一个简洁、可计算、可能近似守恒或可能等于外部控制量的候选表达式。"
+            "你需要像科学家一样解释为什么这个组合值得检验，尤其要利用变量趋势、"
+            "相关性、有效惯性或跨实验对照中出现的线索。"
+            "验证将由程序完成，所以不要声称公式已经成立。"
+            "请只输出严格 JSON。"
+        )
+        user_prompt = f"""
+当前实验上下文：
+{experiment_context}
+
+可用特征量只能来自以下变量：
+{allowed_variables}
+
+这些特征量的统计摘要：
+{chr(10).join(feature_summaries)}
+
+当前实验记录本摘要：
+{notebook_summary}
+
+请提出一个候选表达式。要求：
+1. 表达式只能使用上面列出的变量名、数字常数、括号、+、-、*、/、square(x)、cube(x)、sqrt(x)、log(x)、exp(x)、sin(x)、cos(x)、abs(x)。如果 F_ext 出现在可用变量中，它表示本实验已知的外部控制量。
+2. 不要使用未列出的变量名，不要使用等号，不要输出 Python 赋值语句。
+3. 优先提出低复杂度、可解释的表达式，例如变量乘积、平方项与导数量的组合。
+4. 如果实验是恒定外力场景，可以提出一个可能等于 F_ext 的表达式；否则提出可能近似不随时间变化的表达式。
+5. 只提出一个最值得验证的表达式。
+6. 不要要求调用符号回归、不变量搜索、枚举器或 PySR；这里必须由你直接提出公式。
+7. 不要把明显随时间单调变化的单个原始变量当作候选规律；如果候选评价很差，需要继续定义新量或重新分析。
+
+返回 JSON：
+{{
+  "expression": "...",
+  "output_name": "llm_candidate",
+  "rationale": "...",
+  "expected_relationship": "constant 或 external_force"
+}}
+"""
+        payload = self._request_json(system_prompt=system_prompt, user_prompt=user_prompt)
+        return {
+            "expression": str(payload.get("expression", "")).strip(),
+            "output_name": str(payload.get("output_name", "llm_candidate")).strip() or "llm_candidate",
+            "rationale": str(payload.get("rationale", "LLM 基于当前特征量提出候选表达式。")),
+            "expected_relationship": str(payload.get("expected_relationship", "constant")),
+            "raw_payload": payload,
+        }
 
     def _request_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         response = self.client.chat.completions.create(
@@ -525,12 +601,12 @@ class ScientistAgent:
     ) -> None:
         self.universe = universe
         self.data_tool = data_tool or DataProcessingTool()
-        # 增强搜索参数：更多迭代、更大的复杂度限制和种群大小
-        # 这样 PySR 能探索更复杂的表达式而不是陷入常数拟合
+        # VerificationEngine 仍保留给手动对照实验使用；自主 Agent 的默认动作菜单
+        # 不再暴露不变量枚举，而是让 LLM 基于关系分析主动提出公式。
         self.verification_engine = verification_engine or VerificationEngine(
-            niterations=150,      # 从 80 增加到 150，给更多搜索时间
-            population_size=50,   # 从 33 增加到 50，更好的种群多样性
-            maxsize=30,           # 从 20 增加到 30，允许更复杂的表达式
+            niterations=150,
+            population_size=50,
+            maxsize=30,
         )
         self.brain = brain or HypothesisBrain()
         self.reporter = reporter or ScientificReporter()
@@ -624,14 +700,29 @@ class ScientistAgent:
             return self._action_run_experiment(notebook, params), False
         if action == "smooth_series":
             return self._action_smooth_series(notebook, params), False
+        if action == "estimate_kinematics":
+            return self._action_estimate_kinematics(notebook, params), False
         if action == "differentiate_series":
             return self._action_differentiate_series(notebook, params), False
         if action == "inspect_series":
             return self._action_inspect_series(notebook, params), False
+        if action == "inspect_relationships":
+            return self._action_inspect_relationships(notebook, params), False
+        if action == "define_derived_quantity":
+            return self._action_define_derived_quantity(notebook, params), False
+        if action == "fit_relationship_model":
+            return self._action_fit_relationship_model(notebook, params), False
         if action == "test_candidate_expression":
             return self._action_test_candidate_expression(notebook, params), False
+        if action == "propose_candidate_expression":
+            return self._action_propose_candidate_expression(notebook, step_index, params), False
         if action == "search_invariants":
-            return self._action_search_invariants(notebook, params), False
+            return (
+                "search_invariants 已从自主研究流程中禁用。请像科学家一样先用 "
+                "inspect_relationships 分析变量关系，必要时用 define_derived_quantity "
+                "定义新物理量，再用 propose_candidate_expression 自己提出候选公式。",
+                False,
+            )
         if action == "cross_experiment_check":
             return self._action_cross_experiment_check(notebook, params), False
         if action == "rank_candidate_laws":
@@ -686,7 +777,12 @@ class ScientistAgent:
     ) -> str:
         experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
         source_series = str(params["source_series"])
-        output_name = str(params.get("output_name", f"{source_series}_smooth"))
+        output_name = self._normalize_output_name(
+            params.get("output_name", f"{source_series}_smooth"),
+            f"{source_series}_smooth",
+        )
+        if not self._coerce_bool(params.get("overwrite"), False):
+            output_name = self._make_unique_series_name(notebook, experiment_id, output_name)
 
         t = notebook.get_series_values(experiment_id, "t")
         values = notebook.get_series_values(experiment_id, source_series)
@@ -704,6 +800,69 @@ class ScientistAgent:
         )
         return f"已对 `{source_series}` 平滑，生成 `{output_name}`。{summary}"
 
+    def _action_estimate_kinematics(
+        self,
+        notebook: ScientificNotebook,
+        params: dict[str, Any],
+    ) -> str:
+        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        source_series = str(params.get("source_series", "q"))
+        overwrite = self._coerce_bool(params.get("overwrite"), False)
+
+        position_name = self._normalize_output_name(
+            params.get("position_name", "q_smooth"),
+            default="q_smooth",
+        )
+        velocity_name = self._normalize_output_name(
+            params.get("velocity_name", "v"),
+            default="v",
+        )
+        acceleration_name = self._normalize_output_name(
+            params.get("acceleration_name", "a"),
+            default="a",
+        )
+        if not overwrite:
+            position_name = self._make_unique_series_name(notebook, experiment_id, position_name)
+            velocity_name = self._make_unique_series_name(notebook, experiment_id, velocity_name)
+            acceleration_name = self._make_unique_series_name(notebook, experiment_id, acceleration_name)
+
+        window_length = params.get("window_length")
+        polyorder = params.get("polyorder")
+        t = notebook.get_series_values(experiment_id, "t")
+        q_values = notebook.get_series_values(experiment_id, source_series)
+        estimates = self.data_tool.estimate_kinematics(
+            t=t,
+            q=q_values,
+            window_length=self._coerce_int(window_length, self.data_tool.window_length) if window_length else None,
+            polyorder=self._coerce_int(polyorder, self.data_tool.polyorder) if polyorder else None,
+        )
+
+        output_map = {
+            position_name: ("smoothed position", estimates["q_smooth"]),
+            velocity_name: ("first derivative", estimates["v"]),
+            acceleration_name: ("second derivative", estimates["a"]),
+        }
+        summaries: list[str] = []
+        for output_name, (quantity_text, values) in output_map.items():
+            summary = self.data_tool.summarize_series(t=t, values=values, name=output_name)
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=output_name,
+                    values=values,
+                    source_name=source_series,
+                    provenance=f"Savitzky-Golay kinematics estimation ({quantity_text})",
+                    summary_text=summary.to_text(),
+                )
+            )
+            summaries.append(summary.to_text())
+
+        return (
+            f"已从 `{source_series}` 同时估计运动学序列："
+            f"`{position_name}`, `{velocity_name}`, `{acceleration_name}`。"
+            + " | ".join(summaries)
+        )
+
     def _action_differentiate_series(
         self,
         notebook: ScientificNotebook,
@@ -712,7 +871,12 @@ class ScientistAgent:
         experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
         source_series = str(params["source_series"])
         order = self._coerce_int(params.get("order"), 1)
-        output_name = str(params.get("output_name", f"d{source_series}_order_{order}"))
+        output_name = self._normalize_output_name(
+            params.get("output_name", f"d{source_series}_order_{order}"),
+            f"d{source_series}_order_{order}",
+        )
+        if not self._coerce_bool(params.get("overwrite"), False):
+            output_name = self._make_unique_series_name(notebook, experiment_id, output_name)
         smooth_before = self._coerce_bool(params.get("smooth_before"), True)
         smooth_after = self._coerce_bool(params.get("smooth_after"), True)
 
@@ -762,14 +926,247 @@ class ScientistAgent:
 
         return " | ".join(parts)
 
-    def _action_test_candidate_expression(
+    def _action_inspect_relationships(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
         experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        x_name = params.get("x_series")
+        y_name = params.get("y_series")
+
+        # Backward-compatible parsing for older LLM outputs, but the public prompt
+        # now asks for x_series/y_series only.
+        if x_name is None or y_name is None:
+            feature_series = [str(name) for name in params.get("feature_series", [])]
+            target_series = params.get("target_series")
+            if x_name is None and feature_series:
+                x_name = feature_series[0]
+            if y_name is None and target_series is not None:
+                y_name = target_series
+            elif y_name is None and len(feature_series) >= 2:
+                y_name = feature_series[1]
+
+        if x_name is None or y_name is None:
+            raise ValueError("inspect_relationships 需要 x_series 和 y_series 两个序列名。")
+
+        x_name = str(x_name)
+        y_name = str(y_name)
+        if x_name == y_name:
+            raise ValueError("inspect_relationships 需要两个不同序列。")
+
+        t = notebook.get_series_values(experiment_id, "t")
+        x_values = notebook.get_series_values(experiment_id, x_name)
+        y_values = notebook.get_series_values(experiment_id, y_name)
+
+        figure_path = self._generate_relationship_figure(
+            experiment_id=experiment_id,
+            t=t,
+            x_name=x_name,
+            x_values=x_values,
+            y_name=y_name,
+            y_values=y_values,
+        )
+        x_summary = self.data_tool.summarize_series(t=t, values=x_values, name=x_name).to_text()
+        y_summary = self.data_tool.summarize_series(t=t, values=y_values, name=y_name).to_text()
+        corr = self._safe_correlation(x_values, y_values)
+        observation = self._basic_relationship_observation(
+            x_name=x_name,
+            x_values=x_values,
+            y_name=y_name,
+            y_values=y_values,
+            correlation=corr,
+        )
+        summary_text = (
+            f"关系观察 {experiment_id}: 只比较 `{x_name}` 与 `{y_name}`。"
+            f"关系图={figure_path.resolve()}。"
+            f"{x_summary} | {y_summary} | "
+            f"Pearson correlation={corr:.6f}。"
+            f"中性观察: {observation}"
+        )
+        notebook.notes.append(summary_text)
+        return summary_text
+
+    def _action_define_derived_quantity(
+        self,
+        notebook: ScientificNotebook,
+        params: dict[str, Any],
+    ) -> str:
+        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        raw_symbol = params.get("symbol") or params.get("output_name") or params.get("name")
+        if raw_symbol is None:
+            raise ValueError("define_derived_quantity 需要 symbol 参数。")
+
+        symbol = self._normalize_output_name(raw_symbol, default="derived_quantity")
+        if symbol in {"q", "t"}:
+            raise ValueError("define_derived_quantity 不能覆盖原始序列 `q` 或 `t`。")
+
+        overwrite = self._coerce_bool(params.get("overwrite"), False)
+        if symbol in notebook.derived_series.get(experiment_id, {}) and not overwrite:
+            raise ValueError(
+                f"实验 {experiment_id} 中已存在派生物理量 `{symbol}`。"
+                "如需替换，请设置 overwrite=true。"
+            )
+
+        expression = str(params.get("expression", "")).strip()
+        if not expression:
+            raise ValueError("define_derived_quantity 需要 expression 参数。")
+
+        description = str(params.get("description", "LLM 定义的新物理量。"))
+        values = self._evaluate_expression(notebook, experiment_id, expression)
+        t = notebook.get_series_values(experiment_id, "t")
+        summary = self.data_tool.summarize_series(t=t, values=values, name=symbol)
+        notebook.register_series(
+            DerivedSeries(
+                experiment_id=experiment_id,
+                name=symbol,
+                values=values,
+                source_name=expression,
+                provenance=f"LLM-defined derived physical quantity: {description}",
+                summary_text=summary.to_text(),
+            )
+        )
+        return (
+            f"已定义新物理量 `{symbol}` = `{expression}`。"
+            f"{summary.to_text()}。说明：{description}。"
+            f"后续可在 inspect_relationships、test_candidate_expression、"
+            f"propose_candidate_expression 中直接引用 `{symbol}`。"
+        )
+
+    def _action_fit_relationship_model(
+        self,
+        notebook: ScientificNotebook,
+        params: dict[str, Any],
+    ) -> str:
+        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        target_series = str(params["target_series"])
+        raw_basis_expressions = [
+            str(item).strip()
+            for item in params.get("basis_expressions", [])
+            if str(item).strip()
+        ]
+        include_intercept = self._coerce_bool(params.get("include_intercept"), True)
+        basis_expressions: list[str] = []
+        skipped_terms: list[str] = []
+        for expression in raw_basis_expressions:
+            normalized_expression = expression.replace(" ", "")
+            if include_intercept and normalized_expression in {"1", "1.0"}:
+                skipped_terms.append(expression)
+                continue
+            if expression not in basis_expressions:
+                basis_expressions.append(expression)
+        if not basis_expressions:
+            if include_intercept:
+                raise ValueError("fit_relationship_model 除截距外还需要至少一个非平凡 basis_expressions。")
+            raise ValueError("fit_relationship_model 需要至少一个 basis_expressions。")
+
+        prediction_name = self._make_unique_series_name(
+            notebook,
+            experiment_id,
+            self._normalize_output_name(params.get("prediction_name", "fit_prediction"), "fit_prediction"),
+        )
+        residual_name = self._make_unique_series_name(
+            notebook,
+            experiment_id,
+            self._normalize_output_name(params.get("residual_name", "fit_residual"), "fit_residual"),
+        )
+
+        target_values = notebook.get_series_values(experiment_id, target_series)
+        basis_values = [
+            self._evaluate_expression(notebook, experiment_id, expression)
+            for expression in basis_expressions
+        ]
+        columns: list[np.ndarray] = []
+        term_names: list[str] = []
+        if include_intercept:
+            columns.append(np.ones_like(target_values, dtype=float))
+            term_names.append("1")
+        columns.extend(basis_values)
+        term_names.extend(basis_expressions)
+
+        design = np.column_stack(columns)
+        finite_mask = np.isfinite(target_values) & np.all(np.isfinite(design), axis=1)
+        if finite_mask.sum() < max(5, design.shape[1] + 2):
+            raise ValueError("有限样本点过少，无法稳定拟合关系模型。")
+
+        coeffs, *_ = np.linalg.lstsq(design[finite_mask], target_values[finite_mask], rcond=None)
+        prediction = design @ coeffs
+        residual = target_values - prediction
+
+        finite_target = target_values[finite_mask]
+        finite_prediction = prediction[finite_mask]
+        finite_residual = residual[finite_mask]
+        sst = float(np.sum((finite_target - np.mean(finite_target)) ** 2))
+        r2 = 0.0 if sst <= 1e-12 else 1.0 - float(np.sum(finite_residual * finite_residual)) / sst
+        rmse = float(np.sqrt(np.mean(finite_residual * finite_residual)))
+        mae = float(np.mean(np.abs(finite_residual)))
+
+        t = notebook.get_series_values(experiment_id, "t")
+        prediction_summary = self.data_tool.summarize_series(
+            t=t,
+            values=prediction,
+            name=prediction_name,
+        )
+        residual_summary = self.data_tool.summarize_series(
+            t=t,
+            values=residual,
+            name=residual_name,
+        )
+        equation_terms = [
+            f"{coefficient:.8g}*{term_name}"
+            for coefficient, term_name in zip(coeffs, term_names)
+        ]
+        equation_text = f"{target_series} ≈ " + " + ".join(equation_terms)
+
+        notebook.register_series(
+            DerivedSeries(
+                experiment_id=experiment_id,
+                name=prediction_name,
+                values=prediction,
+                source_name=equation_text,
+                provenance="least-squares relationship model prediction",
+                summary_text=prediction_summary.to_text(),
+            )
+        )
+        notebook.register_series(
+            DerivedSeries(
+                experiment_id=experiment_id,
+                name=residual_name,
+                values=residual,
+                source_name=f"{target_series} - ({equation_text})",
+                provenance="least-squares relationship model residual",
+                summary_text=residual_summary.to_text(),
+            )
+        )
+        notebook.notes.append(
+            f"实验 {experiment_id}: 拟合关系模型 `{equation_text}`，R2={r2:.6f}, "
+            f"RMSE={rmse:.6f}, MAE={mae:.6f}。"
+        )
+        skipped_text = ""
+        if skipped_terms:
+            skipped_text = f" 已忽略与截距重复的常数基函数: {skipped_terms}。"
+        return (
+            f"关系模型拟合完成：`{equation_text}`。"
+            f"R2={r2:.6f}, RMSE={rmse:.6f}, MAE={mae:.6f}。"
+            f"已生成 `{prediction_name}` 和 `{residual_name}`。{skipped_text}"
+            f"{prediction_summary.to_text()} | {residual_summary.to_text()}"
+        )
+
+    def _action_test_candidate_expression(
+        self,
+        notebook: ScientificNotebook,
+        params: dict[str, Any],
+        ) -> str:
+        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
         expression = str(params["expression"])
-        output_name = str(params.get("output_name", "candidate_expression"))
+        output_name = self._make_unique_series_name(
+            notebook,
+            experiment_id,
+            self._normalize_output_name(
+                params.get("output_name", "candidate_expression"),
+                "candidate_expression",
+            ),
+        )
 
         evaluated = self._evaluate_expression(notebook, experiment_id, expression)
         t = notebook.get_series_values(experiment_id, "t")
@@ -788,6 +1185,124 @@ class ScientistAgent:
         return (
             f"表达式 `{expression}` 已求值为 `{output_name}`。{summary.to_text()}。"
             f"相对波动系数约为 {constancy_score:.6f}，越小表示越接近常数。"
+        )
+
+    def _action_propose_candidate_expression(
+        self,
+        notebook: ScientificNotebook,
+        step_index: int,
+        params: dict[str, Any],
+    ) -> str:
+        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        requested_series = params.get("feature_series")
+        if requested_series:
+            feature_series = [str(name) for name in requested_series]
+        else:
+            feature_series = notebook.available_series(experiment_id)
+
+        if not feature_series:
+            raise ValueError("propose_candidate_expression 需要至少一个 feature_series。")
+
+        record = notebook.experiments[experiment_id]
+        t = notebook.get_series_values(experiment_id, "t")
+        feature_summaries: list[str] = []
+        for series_name in feature_series:
+            values = notebook.get_series_values(experiment_id, series_name)
+            summary = self.data_tool.summarize_series(t=t, values=values, name=series_name)
+            feature_summaries.append(f"- {summary.to_text()}")
+        proposal_feature_series = list(feature_series)
+        if record.config.force_field_type is ForceFieldType.CONSTANT:
+            proposal_feature_series.append("F_ext")
+            feature_summaries.append(
+                f"- F_ext: known constant experimental control = {float(record.config.constant_force):.6f}"
+            )
+
+        force_text = (
+            str(record.config.constant_force)
+            if record.config.force_field_type is ForceFieldType.CONSTANT
+            else "N/A（free 场景无外力，constant_force 参数被忽略）"
+        )
+        experiment_context = (
+            f"实验 {experiment_id}: 场景={record.config.force_field_type.value}, "
+            f"F_ext={force_text}, q0={record.config.initial_q}, v0={record.config.initial_v}, "
+            f"t_span={record.config.t_span}, dt={record.config.dt}。"
+        )
+        notebook_summary = self.brain.summarize_notebook(
+            notebook=notebook,
+            goal="基于当前实验特征量提出一个候选动力学表达式，并由程序验证。",
+            max_steps=max(step_index, len(notebook.action_history) + 1),
+        )
+
+        proposal = self.brain.propose_candidate_expression(
+            notebook_summary=notebook_summary,
+            experiment_context=experiment_context,
+            feature_summaries=feature_summaries,
+            feature_series=proposal_feature_series,
+        )
+        expression = str(proposal["expression"]).strip()
+        if not expression:
+            raise ValueError("LLM 未返回可验证的 expression。")
+
+        output_name = self._make_unique_series_name(
+            notebook,
+            experiment_id,
+            self._normalize_output_name(
+                params.get("output_name") or proposal.get("output_name"),
+                default="llm_candidate",
+            ),
+        )
+        evaluated = self._evaluate_expression(notebook, experiment_id, expression)
+        summary = self.data_tool.summarize_series(t=t, values=evaluated, name=output_name)
+        notebook.register_series(
+            DerivedSeries(
+                experiment_id=experiment_id,
+                name=output_name,
+                values=evaluated,
+                source_name=expression,
+                provenance="LLM candidate expression proposal",
+                summary_text=summary.to_text(),
+            )
+        )
+
+        constancy_score = float(summary.std / (abs(summary.mean) + 1e-8))
+        score = constancy_score
+        expected_relationship = str(proposal.get("expected_relationship", "constant"))
+        force_residual_text = ""
+        if record.config.force_field_type is ForceFieldType.CONSTANT:
+            force_residual = float(summary.mean - float(record.config.constant_force))
+            force_residual_text = f"，与 F_ext 的均值残差为 {force_residual:.6f}"
+            if expected_relationship.strip().lower() in {"external_force", "force", "f_ext"}:
+                score = abs(force_residual) + constancy_score
+
+        rationale = str(proposal.get("rationale", "LLM 基于当前特征量提出候选表达式。"))
+        acceptance_threshold = self._coerce_float(params.get("acceptance_threshold"), 0.08)
+        if score <= acceptance_threshold:
+            notebook.add_candidate_law(
+                CandidateLaw(
+                    expression=expression,
+                    source_experiment_id=experiment_id,
+                    score=score,
+                    origin="propose_candidate_expression",
+                    notes=(
+                        f"features={feature_series}; output_name={output_name}; "
+                        f"expected_relationship={expected_relationship}; rationale={rationale}"
+                    ),
+                )
+            )
+            candidate_text = "已登记为候选规律"
+        else:
+            notebook.notes.append(
+                f"实验 {experiment_id}: LLM 提出的 `{expression}` 未登记为候选规律，"
+                f"score={score:.6f} 高于阈值 {acceptance_threshold:.6f}。"
+            )
+            candidate_text = (
+                f"未登记为候选规律，因为 score={score:.6f} 高于阈值 "
+                f"{acceptance_threshold:.6f}"
+            )
+        return (
+            f"LLM 提出候选表达式 `{expression}`，并已求值为 `{output_name}`。"
+            f"{summary.to_text()}。相对波动系数约为 {constancy_score:.6f}"
+            f"{force_residual_text}。{candidate_text}。LLM 理由：{rationale}"
         )
 
     def _action_search_invariants(
@@ -928,10 +1443,11 @@ class ScientistAgent:
         notebook: ScientificNotebook,
     ) -> tuple[str, bool]:
         """防止 LLM 在证据不足时过早结束。"""
-        if not notebook.invariant_history:
+        if not notebook.candidate_laws:
             return (
-                "当前禁止结束：尚未执行任何不变量搜索。请先通过 search_invariants "
-                "寻找候选规律，而不是直接总结定律。",
+                "当前禁止结束：尚未形成任何候选规律。请先用 inspect_relationships "
+                "分析变量关系，必要时通过 define_derived_quantity 定义新物理量，"
+                "再通过 propose_candidate_expression 让 LLM 自己提出候选公式，而不是直接总结定律。",
                 False,
             )
         if not notebook.generalization_checks:
@@ -942,6 +1458,132 @@ class ScientistAgent:
             )
 
         return "LLM 认为当前证据已足够进入规律总结阶段。", True
+
+    def _safe_correlation(self, left: np.ndarray, right: np.ndarray) -> float:
+        left_array = np.asarray(left, dtype=float)
+        right_array = np.asarray(right, dtype=float)
+        finite_mask = np.isfinite(left_array) & np.isfinite(right_array)
+        if finite_mask.sum() < 3:
+            return 0.0
+        left_finite = left_array[finite_mask]
+        right_finite = right_array[finite_mask]
+        if np.std(left_finite) <= 1e-12 or np.std(right_finite) <= 1e-12:
+            return 0.0
+        return float(np.corrcoef(left_finite, right_finite)[0, 1])
+
+    def _generate_relationship_figure(
+        self,
+        experiment_id: str,
+        t: np.ndarray,
+        x_name: str,
+        x_values: np.ndarray,
+        y_name: str,
+        y_values: np.ndarray,
+    ) -> Path:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        output_dir = Path.cwd() / "relationship_assets"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = (
+            f"{self._sanitize_filename_part(experiment_id)}_"
+            f"{self._sanitize_filename_part(x_name)}_vs_"
+            f"{self._sanitize_filename_part(y_name)}.png"
+        )
+        figure_path = output_dir / filename
+
+        t_array = np.asarray(t, dtype=float)
+        x_array = np.asarray(x_values, dtype=float)
+        y_array = np.asarray(y_values, dtype=float)
+        finite_mask = np.isfinite(t_array) & np.isfinite(x_array) & np.isfinite(y_array)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+        axes[0].plot(t_array, self._normalize_for_plot(x_array), label=f"{x_name} (normalized)")
+        axes[0].plot(t_array, self._normalize_for_plot(y_array), label=f"{y_name} (normalized)")
+        axes[0].set_title(f"{experiment_id}: time traces")
+        axes[0].set_xlabel("t")
+        axes[0].set_ylabel("normalized value")
+        axes[0].legend()
+        axes[0].grid(alpha=0.3)
+
+        if finite_mask.sum() > 0:
+            scatter = axes[1].scatter(
+                x_array[finite_mask],
+                y_array[finite_mask],
+                c=t_array[finite_mask],
+                cmap="viridis",
+                s=18,
+                alpha=0.85,
+            )
+            fig.colorbar(scatter, ax=axes[1], label="t")
+        axes[1].set_title(f"{x_name} vs {y_name}")
+        axes[1].set_xlabel(x_name)
+        axes[1].set_ylabel(y_name)
+        axes[1].grid(alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(figure_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return figure_path
+
+    def _basic_relationship_observation(
+        self,
+        x_name: str,
+        x_values: np.ndarray,
+        y_name: str,
+        y_values: np.ndarray,
+        correlation: float,
+    ) -> str:
+        x_trend = self._overall_trend_text(x_values)
+        y_trend = self._overall_trend_text(y_values)
+        if abs(correlation) >= 0.8:
+            relation = "明显同向变化" if correlation > 0 else "明显反向变化"
+        elif abs(correlation) >= 0.4:
+            relation = "有一定同向变化" if correlation > 0 else "有一定反向变化"
+        else:
+            relation = "线性同/反向关系不明显"
+
+        return (
+            f"`{x_name}` 整体趋势为{x_trend}，`{y_name}` 整体趋势为{y_trend}；"
+            f"散点层面表现为{relation}。这一步只提供两序列观察，不构造公式。"
+        )
+
+    def _overall_trend_text(self, values: np.ndarray) -> str:
+        values_array = np.asarray(values, dtype=float)
+        finite_values = values_array[np.isfinite(values_array)]
+        if len(finite_values) < 3:
+            return "样本不足"
+
+        index = np.arange(len(finite_values), dtype=float)
+        slope = float(np.polyfit(index, finite_values, deg=1)[0])
+        scale = float(np.std(finite_values) + 1e-8)
+        normalized_slope = slope * len(finite_values) / scale
+        if normalized_slope > 0.5:
+            return "上升"
+        if normalized_slope < -0.5:
+            return "下降"
+        return "近似平稳或非单调"
+
+    def _normalize_for_plot(self, values: np.ndarray) -> np.ndarray:
+        values_array = np.asarray(values, dtype=float)
+        finite_mask = np.isfinite(values_array)
+        normalized = np.full_like(values_array, np.nan, dtype=float)
+        if finite_mask.sum() == 0:
+            return normalized
+        finite_values = values_array[finite_mask]
+        minimum = float(np.min(finite_values))
+        maximum = float(np.max(finite_values))
+        if abs(maximum - minimum) <= 1e-12:
+            normalized[finite_mask] = 0.0
+        else:
+            normalized[finite_mask] = (finite_values - minimum) / (maximum - minimum)
+        return normalized
+
+    def _sanitize_filename_part(self, value: str) -> str:
+        normalized = re.sub(r"[^0-9A-Za-z_]+", "_", str(value)).strip("_")
+        return normalized or "series"
 
     def _evaluate_expression(
         self,
@@ -958,6 +1600,15 @@ class ScientistAgent:
                 except Exception as e:
                     raise ValueError(f"无法获取序列 '{series_name}' 的值: {e}") from e
 
+            reference_shape = available_names[list(available_names.keys())[0]].shape
+            record = notebook.experiments[experiment_id]
+            force_value = (
+                float(record.config.constant_force)
+                if record.config.force_field_type is ForceFieldType.CONSTANT
+                else 0.0
+            )
+            available_names["F_ext"] = np.full(reference_shape, force_value, dtype=float)
+
             def square(x: np.ndarray) -> np.ndarray:
                 return np.asarray(x, dtype=float) * np.asarray(x, dtype=float)
 
@@ -965,11 +1616,19 @@ class ScientistAgent:
                 x_arr = np.asarray(x, dtype=float)
                 return x_arr * x_arr * x_arr
 
+            def exp(x: np.ndarray) -> np.ndarray:
+                return np.exp(np.clip(np.asarray(x, dtype=float), -60.0, 60.0))
+
             safe_globals = {"__builtins__": {}}
             safe_locals: dict[str, Any] = {
                 **available_names,
                 "square": square,
                 "cube": cube,
+                "sqrt": np.sqrt,
+                "log": np.log,
+                "exp": exp,
+                "sin": np.sin,
+                "cos": np.cos,
                 "abs": np.abs,
                 "np": np,
             }
@@ -978,7 +1637,6 @@ class ScientistAgent:
                 evaluated = eval(expression, safe_globals, safe_locals)
             result = np.asarray(evaluated, dtype=float)
 
-            reference_shape = available_names[list(available_names.keys())[0]].shape
             if result.shape == ():
                 result = np.full(reference_shape, float(result), dtype=float)
 
@@ -1112,6 +1770,33 @@ class ScientistAgent:
             f"未知 force_field_type `{requested_force_field_type}`。"
             "请使用 free/none/no_force 或 constant/constant_force。"
         )
+
+    def _normalize_output_name(self, value: Any, default: str) -> str:
+        """把 LLM 给出的序列名转成可在表达式里引用的 Python 标识符。"""
+        raw = str(value or default).strip()
+        normalized = re.sub(r"[^0-9A-Za-z_]+", "_", raw).strip("_")
+        if not normalized:
+            normalized = default
+        if normalized[0].isdigit():
+            normalized = f"{default}_{normalized}"
+        return normalized
+
+    def _make_unique_series_name(
+        self,
+        notebook: ScientificNotebook,
+        experiment_id: str,
+        desired_name: str,
+    ) -> str:
+        """生成不覆盖已有序列的名字，避免候选量把 a/v 等观测量冲掉。"""
+        normalized = self._normalize_output_name(desired_name, default="series")
+        existing = set(notebook.available_series(experiment_id))
+        if normalized not in existing:
+            return normalized
+
+        index = 2
+        while f"{normalized}_{index}" in existing:
+            index += 1
+        return f"{normalized}_{index}"
 
     def _coerce_float(self, value: Any, default: float) -> float:
         """把 LLM 生成的参数稳健转换为 float。"""
