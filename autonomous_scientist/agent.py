@@ -315,24 +315,24 @@ class HypothesisBrain:
 6. inspect_relationships
 7. define_derived_quantity
 8. fit_relationship_model
-9. propose_candidate_expression
-10. test_candidate_expression
-11. cross_experiment_check
+9. test_candidate_expression
+10. cross_experiment_check
+11. register_candidate_law
 12. rank_candidate_laws
 13. finalize_law
 
 动作说明：
 - run_experiment: 做一个新实验。参数可包含 initial_q, initial_v, force_field_type, constant_force, t_end, dt, noise_std。force_field_type 可用 free/none/no_force 或 constant/constant_force。
-- smooth_series: 对某个已有序列平滑。参数包含 experiment_id, source_series, output_name, overwrite。
-- estimate_kinematics: 从位置序列一次性估计平滑位置、速度和加速度。参数包含 experiment_id, source_series, position_name, velocity_name, acceleration_name, window_length, polyorder, overwrite。它使用同一个局部多项式窗口估计导数，适合从 q(t) 构造 v/a。
-- differentiate_series: 对某个已有序列做一阶或二阶差分。参数包含 experiment_id, source_series, order, output_name, smooth_before, smooth_after, overwrite。
-- inspect_series: 查看一个或多个序列的统计。参数包含 experiment_id, series_names。
-- inspect_relationships: 只查看两个序列之间的关系。参数包含 experiment_id, x_series, y_series。它会生成一张时间轨迹/散点关系图，并输出中性的观察摘要；不会使用外力、平方项拟合或多变量搜索。
-- define_derived_quantity: 定义一个新的可复用物理量。参数包含 experiment_id, symbol, expression, description, overwrite。symbol 是新物理量名称，expression 是构造公式，可使用已有序列名、实验控制量 F_ext 以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
-- fit_relationship_model: 对一个目标序列做由你指定基函数的最小二乘拟合。参数包含 experiment_id, target_series, basis_expressions, prediction_name, residual_name, include_intercept。basis_expressions 由你给出，例如已有序列、新定义物理量或由它们组成的表达式；工具只返回拟合系数和残差，不自动搜索公式。
-- propose_candidate_expression: 让 LLM 基于可用特征量主动提出一个候选表达式，然后由程序立即求值和评分。参数包含 experiment_id, feature_series, output_name, acceptance_threshold。表达式只能使用已有序列名、实验控制量 F_ext、数字常数、括号、+、-、*、/、square(x)、cube(x)、sqrt(x)、log(x)、exp(x)、sin(x)、cos(x)、abs(x)。
-- test_candidate_expression: 测试一个由你提出的表达式是否近似常数。参数包含 experiment_id, expression, output_name。表达式可使用已有序列名以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
+- smooth_series: 对某个已有序列平滑。参数包含 experiment_id 或 experiment_ids, source_series, output_name, overwrite。
+- estimate_kinematics: 从位置序列一次性估计平滑位置、速度和加速度。参数包含 experiment_id 或 experiment_ids, source_series, position_name, velocity_name, acceleration_name, window_length, polyorder, overwrite。它使用同一个局部多项式窗口估计导数，适合从 q(t) 构造 v/a。
+- differentiate_series: 对某个已有序列做一阶或二阶差分。参数包含 experiment_id 或 experiment_ids, source_series, order, output_name, smooth_before, smooth_after, overwrite。
+- inspect_series: 查看一个或多个序列的统计。参数包含 experiment_id 或 experiment_ids, series_names。
+- inspect_relationships: 只查看两个序列之间的关系。参数包含 experiment_id 或 experiment_ids, x_series, y_series。它会为每个实验生成一张时间轨迹/散点关系图，并输出中性的观察摘要；不会使用外力、平方项拟合或多变量搜索。
+- define_derived_quantity: 定义一个新的可复用物理量。参数包含 experiment_id 或 experiment_ids, symbol, expression, description, overwrite。symbol 是新物理量名称，expression 是构造公式，可使用已有序列名、实验控制量 F_ext 以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
+- fit_relationship_model: 对一个目标序列做由你指定基函数的最小二乘拟合。参数包含 experiment_id 或 experiment_ids, target_series, basis_expressions, prediction_name, residual_name, include_intercept。basis_expressions 由你给出，例如已有序列、新定义物理量或由它们组成的表达式；工具只返回拟合系数和残差，不自动搜索公式。
+- test_candidate_expression: 测试一个由你提出的表达式是否近似常数。参数包含 experiment_id 或 experiment_ids, expression, output_name。表达式可使用已有序列名以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
 - cross_experiment_check: 在多个实验之间检查同一表达式的稳定性。参数包含 expression, experiment_ids, metric_name。metric_name 当前支持 relative_std、mean_value、force_residual。若要验证表达式是否等于外力，优先使用 force_residual。
+- register_candidate_law: 登记已经通过跨实验验证的候选规律。参数包含 expression, experiment_id 或 source_experiment_id, notes, score_threshold。工具会查找同一表达式最近一次 cross_experiment_check，并用其 aggregate_score 作为候选规律分数；没有跨实验验证时会拒绝登记。
 - rank_candidate_laws: 对已有候选规律做排序和比较。参数可为空。
 - finalize_law: 当你认为证据已经足够时，结束探索并进入定律总结。
 
@@ -340,16 +340,17 @@ class HypothesisBrain:
 1. 如果还没有实验，先做一个简单基准实验，只观察位置-时间轨迹。
 2. 不要一开始就默认使用任何派生物理量；需要通过观察轨迹后，再决定是否构造变化率或其他序列。
 3. 若你需要速度/加速度，优先用 estimate_kinematics 从 q(t) 同时估计 q_smooth/v/a；只有在特殊情况下才直接对已有序列差分。
-4. 在提出公式前，优先用 inspect_series 和 inspect_relationships 主动观察变量关系。inspect_relationships 每次只能比较两个序列，例如先看 v 与 a，再另起一步看新定义量与 a。
-5. 如果观察到某种组合可能有物理意义，可以先用 define_derived_quantity 给它命名，再用 inspect_relationships 观察这个新量和其他量的关系。
-6. 如果你想检验“某个目标是否可由若干自定义特征解释”，使用 fit_relationship_model，但基函数必须由你基于观察主动指定。
-7. 当你已经看到足够关系线索时，使用 propose_candidate_expression 自己提出公式；不要调用不变量搜索、符号回归、枚举搜索或 PySR。
-8. 如果某个解释只在单个实验里成立，不应立刻接受；优先尝试新的实验条件来复验。
-9. 在设计新实验时，尽量改变初始条件、控制参数或对照场景，以增加辨识力。
-10. 不要把“拟合某个控制参数的常数”当作发现定律；更好的做法是先由你基于证据提出候选量，然后再做跨实验验证。
-11. 若你认为已有证据支持某条规律，可选择 finalize_law，但前提是至少存在一条候选规律和一次跨实验验证。
-12. 如果 propose_candidate_expression 返回的候选被评价为波动大或残差大，应继续处理数据、定义新量或重新设计实验，不要把它当作规律。
-13. 总步数上限为 {max_steps}，因此动作要尽量高信息密度。
+4. 当多个实验都需要同一种处理时，优先用 experiment_ids 批量处理，避免重复单实验步骤。例如一次性对多个 constant 实验 estimate_kinematics、inspect_relationships、define_derived_quantity 或 fit_relationship_model。
+5. 在提出公式前，优先用 inspect_series 和 inspect_relationships 主动观察变量关系。inspect_relationships 每次只能比较两个序列，例如先看 v 与 a，再另起一步看新定义量与 a。
+6. 如果观察到某种组合可能有物理意义，可以先用 define_derived_quantity 给它命名，再用 inspect_relationships 观察这个新量和其他量的关系。
+7. 如果你想检验“某个目标是否可由若干自定义特征解释”，使用 fit_relationship_model，但基函数必须由你基于观察主动指定。
+8. 当你已经看到足够关系线索时，在 thought 中直接提出公式，然后用 test_candidate_expression 和 cross_experiment_check 验证；不要调用不变量搜索、符号回归、枚举搜索、PySR 或额外的公式提案器。
+9. 如果某个解释只在单个实验里成立，不应立刻接受；优先尝试新的实验条件来复验。
+10. 在设计新实验时，尽量改变初始条件、控制参数或对照场景，以增加辨识力。
+11. 不要把“拟合某个控制参数的常数”当作发现定律；更好的做法是先由你基于证据提出候选量，然后再做跨实验验证。
+12. 当某个表达式已经通过跨实验验证且分数足够低，调用 register_candidate_law 把它登记为候选规律。
+13. 若你认为已有证据支持某条规律，可选择 finalize_law，但前提是至少存在一条候选规律和一次跨实验验证。
+14. 总步数上限为 {max_steps}，因此动作要尽量高信息密度。
 
 请只返回 JSON：
 {{
@@ -400,62 +401,6 @@ class HypothesisBrain:
             next_steps=str(payload.get("next_steps", "建议继续做更多外力与初速度条件下的实验。")),
             raw_payload=payload,
         )
-
-    def propose_candidate_expression(
-        self,
-        notebook_summary: str,
-        experiment_context: str,
-        feature_summaries: list[str],
-        feature_series: list[str],
-    ) -> dict[str, Any]:
-        """让 LLM 基于已构造的特征量提出一个待验证表达式。"""
-        allowed_variables = ", ".join(f"`{name}`" for name in feature_series)
-        system_prompt = (
-            "你是一个物理公式提案器。你的任务不是验证公式，而是基于已有时间序列特征"
-            "提出一个简洁、可计算、可能近似守恒或可能等于外部控制量的候选表达式。"
-            "你需要像科学家一样解释为什么这个组合值得检验，尤其要利用变量趋势、"
-            "相关性、有效惯性或跨实验对照中出现的线索。"
-            "验证将由程序完成，所以不要声称公式已经成立。"
-            "请只输出严格 JSON。"
-        )
-        user_prompt = f"""
-当前实验上下文：
-{experiment_context}
-
-可用特征量只能来自以下变量：
-{allowed_variables}
-
-这些特征量的统计摘要：
-{chr(10).join(feature_summaries)}
-
-当前实验记录本摘要：
-{notebook_summary}
-
-请提出一个候选表达式。要求：
-1. 表达式只能使用上面列出的变量名、数字常数、括号、+、-、*、/、square(x)、cube(x)、sqrt(x)、log(x)、exp(x)、sin(x)、cos(x)、abs(x)。如果 F_ext 出现在可用变量中，它表示本实验已知的外部控制量。
-2. 不要使用未列出的变量名，不要使用等号，不要输出 Python 赋值语句。
-3. 优先提出低复杂度、可解释的表达式，例如变量乘积、平方项与导数量的组合。
-4. 如果实验是恒定外力场景，可以提出一个可能等于 F_ext 的表达式；否则提出可能近似不随时间变化的表达式。
-5. 只提出一个最值得验证的表达式。
-6. 不要要求调用符号回归、不变量搜索、枚举器或 PySR；这里必须由你直接提出公式。
-7. 不要把明显随时间单调变化的单个原始变量当作候选规律；如果候选评价很差，需要继续定义新量或重新分析。
-
-返回 JSON：
-{{
-  "expression": "...",
-  "output_name": "llm_candidate",
-  "rationale": "...",
-  "expected_relationship": "constant 或 external_force"
-}}
-"""
-        payload = self._request_json(system_prompt=system_prompt, user_prompt=user_prompt)
-        return {
-            "expression": str(payload.get("expression", "")).strip(),
-            "output_name": str(payload.get("output_name", "llm_candidate")).strip() or "llm_candidate",
-            "rationale": str(payload.get("rationale", "LLM 基于当前特征量提出候选表达式。")),
-            "expected_relationship": str(payload.get("expected_relationship", "constant")),
-            "raw_payload": payload,
-        }
 
     def _request_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         response = self.client.chat.completions.create(
@@ -715,16 +660,23 @@ class ScientistAgent:
         if action == "test_candidate_expression":
             return self._action_test_candidate_expression(notebook, params), False
         if action == "propose_candidate_expression":
-            return self._action_propose_candidate_expression(notebook, step_index, params), False
+            return (
+                "propose_candidate_expression 已从动作菜单中隐藏。请直接在 thought 中提出公式，"
+                "用 test_candidate_expression / cross_experiment_check 验证，然后用 "
+                "register_candidate_law 登记已经通过跨实验验证的候选规律。",
+                False,
+            )
         if action == "search_invariants":
             return (
                 "search_invariants 已从自主研究流程中禁用。请像科学家一样先用 "
                 "inspect_relationships 分析变量关系，必要时用 define_derived_quantity "
-                "定义新物理量，再用 propose_candidate_expression 自己提出候选公式。",
+                "定义新物理量，再直接测试并跨实验验证自己提出的候选公式。",
                 False,
             )
         if action == "cross_experiment_check":
             return self._action_cross_experiment_check(notebook, params), False
+        if action == "register_candidate_law":
+            return self._action_register_candidate_law(notebook, params), False
         if action == "rank_candidate_laws":
             return self._action_rank_candidate_laws(notebook), False
         if action == "finalize_law":
@@ -775,163 +727,211 @@ class ScientistAgent:
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
         source_series = str(params["source_series"])
-        output_name = self._normalize_output_name(
+        base_output_name = self._normalize_output_name(
             params.get("output_name", f"{source_series}_smooth"),
             f"{source_series}_smooth",
         )
-        if not self._coerce_bool(params.get("overwrite"), False):
-            output_name = self._make_unique_series_name(notebook, experiment_id, output_name)
+        overwrite = self._coerce_bool(params.get("overwrite"), False)
 
-        t = notebook.get_series_values(experiment_id, "t")
-        values = notebook.get_series_values(experiment_id, source_series)
-        smoothed = self.data_tool.smooth_series(t=t, values=values)
-        summary = self.data_tool.summarize_series(t=t, values=smoothed, name=output_name).to_text()
-        notebook.register_series(
-            DerivedSeries(
-                experiment_id=experiment_id,
-                name=output_name,
-                values=smoothed,
-                source_name=source_series,
-                provenance="Savitzky-Golay smoothing",
-                summary_text=summary,
+        parts: list[str] = []
+        for experiment_id in experiment_ids:
+            output_name = base_output_name
+            if not overwrite:
+                output_name = self._make_unique_series_name(notebook, experiment_id, output_name)
+
+            t = notebook.get_series_values(experiment_id, "t")
+            values = notebook.get_series_values(experiment_id, source_series)
+            smoothed = self.data_tool.smooth_series(t=t, values=values)
+            summary = self.data_tool.summarize_series(t=t, values=smoothed, name=output_name).to_text()
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=output_name,
+                    values=smoothed,
+                    source_name=source_series,
+                    provenance="Savitzky-Golay smoothing",
+                    summary_text=summary,
+                )
             )
-        )
-        return f"已对 `{source_series}` 平滑，生成 `{output_name}`。{summary}"
+            parts.append(f"{experiment_id}: 已对 `{source_series}` 平滑，生成 `{output_name}`。{summary}")
+
+        return self._format_batch_result("批量平滑完成", parts)
 
     def _action_estimate_kinematics(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
         source_series = str(params.get("source_series", "q"))
         overwrite = self._coerce_bool(params.get("overwrite"), False)
 
-        position_name = self._normalize_output_name(
+        base_position_name = self._normalize_output_name(
             params.get("position_name", "q_smooth"),
             default="q_smooth",
         )
-        velocity_name = self._normalize_output_name(
+        base_velocity_name = self._normalize_output_name(
             params.get("velocity_name", "v"),
             default="v",
         )
-        acceleration_name = self._normalize_output_name(
+        base_acceleration_name = self._normalize_output_name(
             params.get("acceleration_name", "a"),
             default="a",
         )
-        if not overwrite:
-            position_name = self._make_unique_series_name(notebook, experiment_id, position_name)
-            velocity_name = self._make_unique_series_name(notebook, experiment_id, velocity_name)
-            acceleration_name = self._make_unique_series_name(notebook, experiment_id, acceleration_name)
 
         window_length = params.get("window_length")
         polyorder = params.get("polyorder")
-        t = notebook.get_series_values(experiment_id, "t")
-        q_values = notebook.get_series_values(experiment_id, source_series)
-        estimates = self.data_tool.estimate_kinematics(
-            t=t,
-            q=q_values,
-            window_length=self._coerce_int(window_length, self.data_tool.window_length) if window_length else None,
-            polyorder=self._coerce_int(polyorder, self.data_tool.polyorder) if polyorder else None,
-        )
 
-        output_map = {
-            position_name: ("smoothed position", estimates["q_smooth"]),
-            velocity_name: ("first derivative", estimates["v"]),
-            acceleration_name: ("second derivative", estimates["a"]),
-        }
-        summaries: list[str] = []
-        for output_name, (quantity_text, values) in output_map.items():
-            summary = self.data_tool.summarize_series(t=t, values=values, name=output_name)
-            notebook.register_series(
-                DerivedSeries(
-                    experiment_id=experiment_id,
-                    name=output_name,
-                    values=values,
-                    source_name=source_series,
-                    provenance=f"Savitzky-Golay kinematics estimation ({quantity_text})",
-                    summary_text=summary.to_text(),
-                )
+        parts: list[str] = []
+        for experiment_id in experiment_ids:
+            position_name = base_position_name
+            velocity_name = base_velocity_name
+            acceleration_name = base_acceleration_name
+            if not overwrite:
+                position_name = self._make_unique_series_name(notebook, experiment_id, position_name)
+                velocity_name = self._make_unique_series_name(notebook, experiment_id, velocity_name)
+                acceleration_name = self._make_unique_series_name(notebook, experiment_id, acceleration_name)
+
+            t = notebook.get_series_values(experiment_id, "t")
+            q_values = notebook.get_series_values(experiment_id, source_series)
+            estimates = self.data_tool.estimate_kinematics(
+                t=t,
+                q=q_values,
+                window_length=self._coerce_int(window_length, self.data_tool.window_length) if window_length else None,
+                polyorder=self._coerce_int(polyorder, self.data_tool.polyorder) if polyorder else None,
             )
-            summaries.append(summary.to_text())
 
-        return (
-            f"已从 `{source_series}` 同时估计运动学序列："
-            f"`{position_name}`, `{velocity_name}`, `{acceleration_name}`。"
-            + " | ".join(summaries)
-        )
+            output_map = {
+                position_name: ("smoothed position", estimates["q_smooth"]),
+                velocity_name: ("first derivative", estimates["v"]),
+                acceleration_name: ("second derivative", estimates["a"]),
+            }
+            summaries: list[str] = []
+            for output_name, (quantity_text, values) in output_map.items():
+                summary = self.data_tool.summarize_series(t=t, values=values, name=output_name)
+                notebook.register_series(
+                    DerivedSeries(
+                        experiment_id=experiment_id,
+                        name=output_name,
+                        values=values,
+                        source_name=source_series,
+                        provenance=f"Savitzky-Golay kinematics estimation ({quantity_text})",
+                        summary_text=summary.to_text(),
+                    )
+                )
+                summaries.append(summary.to_text())
+            parts.append(
+                f"{experiment_id}: 已从 `{source_series}` 同时估计 "
+                f"`{position_name}`, `{velocity_name}`, `{acceleration_name}`。"
+                + " | ".join(summaries)
+            )
+
+        return self._format_batch_result("批量运动学估计完成", parts)
 
     def _action_differentiate_series(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
         source_series = str(params["source_series"])
         order = self._coerce_int(params.get("order"), 1)
-        output_name = self._normalize_output_name(
+        base_output_name = self._normalize_output_name(
             params.get("output_name", f"d{source_series}_order_{order}"),
             f"d{source_series}_order_{order}",
         )
-        if not self._coerce_bool(params.get("overwrite"), False):
-            output_name = self._make_unique_series_name(notebook, experiment_id, output_name)
+        overwrite = self._coerce_bool(params.get("overwrite"), False)
         smooth_before = self._coerce_bool(params.get("smooth_before"), True)
         smooth_after = self._coerce_bool(params.get("smooth_after"), True)
 
-        t = notebook.get_series_values(experiment_id, "t")
-        values = notebook.get_series_values(experiment_id, source_series)
-        differentiated = self.data_tool.differentiate_series(
-            t=t,
-            values=values,
-            order=order,
-            smooth_before=smooth_before,
-            smooth_after=smooth_after,
-        )
-        summary = self.data_tool.summarize_series(t=t, values=differentiated, name=output_name).to_text()
-        notebook.register_series(
-            DerivedSeries(
-                experiment_id=experiment_id,
-                name=output_name,
-                values=differentiated,
-                source_name=source_series,
-                provenance=f"{order} order differentiation",
-                summary_text=summary,
+        parts: list[str] = []
+        for experiment_id in experiment_ids:
+            output_name = base_output_name
+            if not overwrite:
+                output_name = self._make_unique_series_name(notebook, experiment_id, output_name)
+
+            t = notebook.get_series_values(experiment_id, "t")
+            values = notebook.get_series_values(experiment_id, source_series)
+            differentiated = self.data_tool.differentiate_series(
+                t=t,
+                values=values,
+                order=order,
+                smooth_before=smooth_before,
+                smooth_after=smooth_after,
             )
-        )
-        return f"已对 `{source_series}` 做 {order} 阶差分，生成 `{output_name}`。{summary}"
+            summary = self.data_tool.summarize_series(t=t, values=differentiated, name=output_name).to_text()
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=output_name,
+                    values=differentiated,
+                    source_name=source_series,
+                    provenance=f"{order} order differentiation",
+                    summary_text=summary,
+                )
+            )
+            parts.append(f"{experiment_id}: 已对 `{source_series}` 做 {order} 阶差分，生成 `{output_name}`。{summary}")
+
+        return self._format_batch_result("批量差分完成", parts)
 
     def _action_inspect_series(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
-        series_names = [str(name) for name in params.get("series_names", notebook.available_series(experiment_id))]
-        t = notebook.get_series_values(experiment_id, "t")
-        parts: list[str] = []
-        for series_name in series_names:
-            values = notebook.get_series_values(experiment_id, series_name)
-            parts.append(self.data_tool.summarize_series(t=t, values=values, name=series_name).to_text())
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
+        batch_parts: list[str] = []
+        for experiment_id in experiment_ids:
+            series_names = [
+                str(name)
+                for name in params.get("series_names", notebook.available_series(experiment_id))
+            ]
+            t = notebook.get_series_values(experiment_id, "t")
+            parts: list[str] = []
+            for series_name in series_names:
+                values = notebook.get_series_values(experiment_id, series_name)
+                parts.append(self.data_tool.summarize_series(t=t, values=values, name=series_name).to_text())
 
-        if len(series_names) >= 2:
-            left = notebook.get_series_values(experiment_id, series_names[0])
-            right = notebook.get_series_values(experiment_id, series_names[1])
-            score = self.data_tool.compute_relationship_score(left, right)
-            parts.append(
-                f"{series_names[0]} vs {series_names[1]}: "
-                f"correlation={score['correlation']:.6f}, mse={score['mse']:.6f}"
-            )
+            if len(series_names) >= 2:
+                left = notebook.get_series_values(experiment_id, series_names[0])
+                right = notebook.get_series_values(experiment_id, series_names[1])
+                score = self.data_tool.compute_relationship_score(left, right)
+                parts.append(
+                    f"{series_names[0]} vs {series_names[1]}: "
+                    f"correlation={score['correlation']:.6f}, mse={score['mse']:.6f}"
+                )
+            batch_parts.append(f"{experiment_id}: " + " | ".join(parts))
 
-        return " | ".join(parts)
+        return self._format_batch_result("批量序列检查完成", batch_parts)
 
     def _action_inspect_relationships(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
         x_name = params.get("x_series")
         y_name = params.get("y_series")
 
@@ -955,44 +955,52 @@ class ScientistAgent:
         if x_name == y_name:
             raise ValueError("inspect_relationships 需要两个不同序列。")
 
-        t = notebook.get_series_values(experiment_id, "t")
-        x_values = notebook.get_series_values(experiment_id, x_name)
-        y_values = notebook.get_series_values(experiment_id, y_name)
+        batch_parts: list[str] = []
+        for experiment_id in experiment_ids:
+            t = notebook.get_series_values(experiment_id, "t")
+            x_values = notebook.get_series_values(experiment_id, x_name)
+            y_values = notebook.get_series_values(experiment_id, y_name)
 
-        figure_path = self._generate_relationship_figure(
-            experiment_id=experiment_id,
-            t=t,
-            x_name=x_name,
-            x_values=x_values,
-            y_name=y_name,
-            y_values=y_values,
-        )
-        x_summary = self.data_tool.summarize_series(t=t, values=x_values, name=x_name).to_text()
-        y_summary = self.data_tool.summarize_series(t=t, values=y_values, name=y_name).to_text()
-        corr = self._safe_correlation(x_values, y_values)
-        observation = self._basic_relationship_observation(
-            x_name=x_name,
-            x_values=x_values,
-            y_name=y_name,
-            y_values=y_values,
-            correlation=corr,
-        )
-        summary_text = (
-            f"关系观察 {experiment_id}: 只比较 `{x_name}` 与 `{y_name}`。"
-            f"关系图={figure_path.resolve()}。"
-            f"{x_summary} | {y_summary} | "
-            f"Pearson correlation={corr:.6f}。"
-            f"中性观察: {observation}"
-        )
-        notebook.notes.append(summary_text)
-        return summary_text
+            figure_path = self._generate_relationship_figure(
+                experiment_id=experiment_id,
+                t=t,
+                x_name=x_name,
+                x_values=x_values,
+                y_name=y_name,
+                y_values=y_values,
+            )
+            x_summary = self.data_tool.summarize_series(t=t, values=x_values, name=x_name).to_text()
+            y_summary = self.data_tool.summarize_series(t=t, values=y_values, name=y_name).to_text()
+            corr = self._safe_correlation(x_values, y_values)
+            observation = self._basic_relationship_observation(
+                x_name=x_name,
+                x_values=x_values,
+                y_name=y_name,
+                y_values=y_values,
+                correlation=corr,
+            )
+            summary_text = (
+                f"关系观察 {experiment_id}: 只比较 `{x_name}` 与 `{y_name}`。"
+                f"关系图={figure_path.resolve()}。"
+                f"{x_summary} | {y_summary} | "
+                f"Pearson correlation={corr:.6f}。"
+                f"中性观察: {observation}"
+            )
+            notebook.notes.append(summary_text)
+            batch_parts.append(summary_text)
+
+        return self._format_batch_result("批量关系观察完成", batch_parts)
 
     def _action_define_derived_quantity(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
         raw_symbol = params.get("symbol") or params.get("output_name") or params.get("name")
         if raw_symbol is None:
             raise ValueError("define_derived_quantity 需要 symbol 参数。")
@@ -1002,43 +1010,57 @@ class ScientistAgent:
             raise ValueError("define_derived_quantity 不能覆盖原始序列 `q` 或 `t`。")
 
         overwrite = self._coerce_bool(params.get("overwrite"), False)
-        if symbol in notebook.derived_series.get(experiment_id, {}) and not overwrite:
-            raise ValueError(
-                f"实验 {experiment_id} 中已存在派生物理量 `{symbol}`。"
-                "如需替换，请设置 overwrite=true。"
-            )
-
         expression = str(params.get("expression", "")).strip()
         if not expression:
             raise ValueError("define_derived_quantity 需要 expression 参数。")
 
         description = str(params.get("description", "LLM 定义的新物理量。"))
-        values = self._evaluate_expression(notebook, experiment_id, expression)
-        t = notebook.get_series_values(experiment_id, "t")
-        summary = self.data_tool.summarize_series(t=t, values=values, name=symbol)
-        notebook.register_series(
-            DerivedSeries(
-                experiment_id=experiment_id,
-                name=symbol,
-                values=values,
-                source_name=expression,
-                provenance=f"LLM-defined derived physical quantity: {description}",
-                summary_text=summary.to_text(),
+        parts: list[str] = []
+        for experiment_id in experiment_ids:
+            existing_series = notebook.derived_series.get(experiment_id, {}).get(symbol)
+            if existing_series is not None and not overwrite:
+                if existing_series.source_name.replace(" ", "") == expression.replace(" ", ""):
+                    parts.append(f"{experiment_id}: `{symbol}` 已存在且表达式相同，保留原序列。")
+                    continue
+                raise ValueError(
+                    f"实验 {experiment_id} 中已存在派生物理量 `{symbol}`。"
+                    "如需替换，请设置 overwrite=true。"
+                )
+
+            values = self._evaluate_expression(notebook, experiment_id, expression)
+            t = notebook.get_series_values(experiment_id, "t")
+            summary = self.data_tool.summarize_series(t=t, values=values, name=symbol)
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=symbol,
+                    values=values,
+                    source_name=expression,
+                    provenance=f"LLM-defined derived physical quantity: {description}",
+                    summary_text=summary.to_text(),
+                )
             )
-        )
-        return (
-            f"已定义新物理量 `{symbol}` = `{expression}`。"
-            f"{summary.to_text()}。说明：{description}。"
+            parts.append(
+                f"{experiment_id}: 已定义 `{symbol}` = `{expression}`。"
+                f"{summary.to_text()}。说明：{description}。"
+            )
+
+        suffix = (
             f"后续可在 inspect_relationships、test_candidate_expression、"
-            f"propose_candidate_expression 中直接引用 `{symbol}`。"
+            f"cross_experiment_check 中直接引用 `{symbol}`。"
         )
+        return self._format_batch_result("批量定义新物理量完成", parts) + "\n" + suffix
 
     def _action_fit_relationship_model(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
     ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
         target_series = str(params["target_series"])
         raw_basis_expressions = [
             str(item).strip()
@@ -1060,250 +1082,144 @@ class ScientistAgent:
                 raise ValueError("fit_relationship_model 除截距外还需要至少一个非平凡 basis_expressions。")
             raise ValueError("fit_relationship_model 需要至少一个 basis_expressions。")
 
-        prediction_name = self._make_unique_series_name(
-            notebook,
-            experiment_id,
-            self._normalize_output_name(params.get("prediction_name", "fit_prediction"), "fit_prediction"),
-        )
-        residual_name = self._make_unique_series_name(
-            notebook,
-            experiment_id,
-            self._normalize_output_name(params.get("residual_name", "fit_residual"), "fit_residual"),
-        )
+        parts: list[str] = []
+        for experiment_id in experiment_ids:
+            prediction_name = self._make_unique_series_name(
+                notebook,
+                experiment_id,
+                self._normalize_output_name(params.get("prediction_name", "fit_prediction"), "fit_prediction"),
+            )
+            residual_name = self._make_unique_series_name(
+                notebook,
+                experiment_id,
+                self._normalize_output_name(params.get("residual_name", "fit_residual"), "fit_residual"),
+            )
 
-        target_values = notebook.get_series_values(experiment_id, target_series)
-        basis_values = [
-            self._evaluate_expression(notebook, experiment_id, expression)
-            for expression in basis_expressions
-        ]
-        columns: list[np.ndarray] = []
-        term_names: list[str] = []
-        if include_intercept:
-            columns.append(np.ones_like(target_values, dtype=float))
-            term_names.append("1")
-        columns.extend(basis_values)
-        term_names.extend(basis_expressions)
+            target_values = notebook.get_series_values(experiment_id, target_series)
+            basis_values = [
+                self._evaluate_expression(notebook, experiment_id, expression)
+                for expression in basis_expressions
+            ]
+            columns: list[np.ndarray] = []
+            term_names: list[str] = []
+            if include_intercept:
+                columns.append(np.ones_like(target_values, dtype=float))
+                term_names.append("1")
+            columns.extend(basis_values)
+            term_names.extend(basis_expressions)
 
-        design = np.column_stack(columns)
-        finite_mask = np.isfinite(target_values) & np.all(np.isfinite(design), axis=1)
-        if finite_mask.sum() < max(5, design.shape[1] + 2):
-            raise ValueError("有限样本点过少，无法稳定拟合关系模型。")
+            design = np.column_stack(columns)
+            finite_mask = np.isfinite(target_values) & np.all(np.isfinite(design), axis=1)
+            if finite_mask.sum() < max(5, design.shape[1] + 2):
+                raise ValueError(f"{experiment_id}: 有限样本点过少，无法稳定拟合关系模型。")
 
-        coeffs, *_ = np.linalg.lstsq(design[finite_mask], target_values[finite_mask], rcond=None)
-        prediction = design @ coeffs
-        residual = target_values - prediction
+            coeffs, *_ = np.linalg.lstsq(design[finite_mask], target_values[finite_mask], rcond=None)
+            prediction = design @ coeffs
+            residual = target_values - prediction
 
-        finite_target = target_values[finite_mask]
-        finite_prediction = prediction[finite_mask]
-        finite_residual = residual[finite_mask]
-        sst = float(np.sum((finite_target - np.mean(finite_target)) ** 2))
-        r2 = 0.0 if sst <= 1e-12 else 1.0 - float(np.sum(finite_residual * finite_residual)) / sst
-        rmse = float(np.sqrt(np.mean(finite_residual * finite_residual)))
-        mae = float(np.mean(np.abs(finite_residual)))
+            finite_target = target_values[finite_mask]
+            finite_residual = residual[finite_mask]
+            sst = float(np.sum((finite_target - np.mean(finite_target)) ** 2))
+            r2 = 0.0 if sst <= 1e-12 else 1.0 - float(np.sum(finite_residual * finite_residual)) / sst
+            rmse = float(np.sqrt(np.mean(finite_residual * finite_residual)))
+            mae = float(np.mean(np.abs(finite_residual)))
 
-        t = notebook.get_series_values(experiment_id, "t")
-        prediction_summary = self.data_tool.summarize_series(
-            t=t,
-            values=prediction,
-            name=prediction_name,
-        )
-        residual_summary = self.data_tool.summarize_series(
-            t=t,
-            values=residual,
-            name=residual_name,
-        )
-        equation_terms = [
-            f"{coefficient:.8g}*{term_name}"
-            for coefficient, term_name in zip(coeffs, term_names)
-        ]
-        equation_text = f"{target_series} ≈ " + " + ".join(equation_terms)
-
-        notebook.register_series(
-            DerivedSeries(
-                experiment_id=experiment_id,
-                name=prediction_name,
+            t = notebook.get_series_values(experiment_id, "t")
+            prediction_summary = self.data_tool.summarize_series(
+                t=t,
                 values=prediction,
-                source_name=equation_text,
-                provenance="least-squares relationship model prediction",
-                summary_text=prediction_summary.to_text(),
+                name=prediction_name,
             )
-        )
-        notebook.register_series(
-            DerivedSeries(
-                experiment_id=experiment_id,
-                name=residual_name,
+            residual_summary = self.data_tool.summarize_series(
+                t=t,
                 values=residual,
-                source_name=f"{target_series} - ({equation_text})",
-                provenance="least-squares relationship model residual",
-                summary_text=residual_summary.to_text(),
+                name=residual_name,
             )
-        )
-        notebook.notes.append(
-            f"实验 {experiment_id}: 拟合关系模型 `{equation_text}`，R2={r2:.6f}, "
-            f"RMSE={rmse:.6f}, MAE={mae:.6f}。"
-        )
-        skipped_text = ""
-        if skipped_terms:
-            skipped_text = f" 已忽略与截距重复的常数基函数: {skipped_terms}。"
-        return (
-            f"关系模型拟合完成：`{equation_text}`。"
-            f"R2={r2:.6f}, RMSE={rmse:.6f}, MAE={mae:.6f}。"
-            f"已生成 `{prediction_name}` 和 `{residual_name}`。{skipped_text}"
-            f"{prediction_summary.to_text()} | {residual_summary.to_text()}"
-        )
+            equation_terms = [
+                f"{coefficient:.8g}*{term_name}"
+                for coefficient, term_name in zip(coeffs, term_names)
+            ]
+            equation_text = f"{target_series} ≈ " + " + ".join(equation_terms)
+
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=prediction_name,
+                    values=prediction,
+                    source_name=equation_text,
+                    provenance="least-squares relationship model prediction",
+                    summary_text=prediction_summary.to_text(),
+                )
+            )
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=residual_name,
+                    values=residual,
+                    source_name=f"{target_series} - ({equation_text})",
+                    provenance="least-squares relationship model residual",
+                    summary_text=residual_summary.to_text(),
+                )
+            )
+            notebook.notes.append(
+                f"实验 {experiment_id}: 拟合关系模型 `{equation_text}`，R2={r2:.6f}, "
+                f"RMSE={rmse:.6f}, MAE={mae:.6f}。"
+            )
+            skipped_text = ""
+            if skipped_terms:
+                skipped_text = f" 已忽略与截距重复的常数基函数: {skipped_terms}。"
+            parts.append(
+                f"{experiment_id}: 关系模型拟合完成：`{equation_text}`。"
+                f"R2={r2:.6f}, RMSE={rmse:.6f}, MAE={mae:.6f}。"
+                f"已生成 `{prediction_name}` 和 `{residual_name}`。{skipped_text}"
+                f"{prediction_summary.to_text()} | {residual_summary.to_text()}"
+            )
+
+        return self._format_batch_result("批量关系模型拟合完成", parts)
 
     def _action_test_candidate_expression(
         self,
         notebook: ScientificNotebook,
         params: dict[str, Any],
         ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
+        experiment_ids = self._resolve_experiment_ids_for_action(
+            notebook,
+            requested_experiment_ids=params.get("experiment_ids"),
+            fallback_experiment_id=params.get("experiment_id"),
+        )
         expression = str(params["expression"])
-        output_name = self._make_unique_series_name(
-            notebook,
-            experiment_id,
-            self._normalize_output_name(
-                params.get("output_name", "candidate_expression"),
-                "candidate_expression",
-            ),
+        base_output_name = self._normalize_output_name(
+            params.get("output_name", "candidate_expression"),
+            "candidate_expression",
         )
 
-        evaluated = self._evaluate_expression(notebook, experiment_id, expression)
-        t = notebook.get_series_values(experiment_id, "t")
-        summary = self.data_tool.summarize_series(t=t, values=evaluated, name=output_name)
-        notebook.register_series(
-            DerivedSeries(
-                experiment_id=experiment_id,
-                name=output_name,
-                values=evaluated,
-                source_name=expression,
-                provenance="candidate expression evaluation",
-                summary_text=summary.to_text(),
+        parts: list[str] = []
+        for experiment_id in experiment_ids:
+            output_name = self._make_unique_series_name(
+                notebook,
+                experiment_id,
+                base_output_name,
             )
-        )
-        constancy_score = float(summary.std / (abs(summary.mean) + 1e-8))
-        return (
-            f"表达式 `{expression}` 已求值为 `{output_name}`。{summary.to_text()}。"
-            f"相对波动系数约为 {constancy_score:.6f}，越小表示越接近常数。"
-        )
-
-    def _action_propose_candidate_expression(
-        self,
-        notebook: ScientificNotebook,
-        step_index: int,
-        params: dict[str, Any],
-    ) -> str:
-        experiment_id = self._resolve_experiment_id(notebook, params.get("experiment_id"))
-        requested_series = params.get("feature_series")
-        if requested_series:
-            feature_series = [str(name) for name in requested_series]
-        else:
-            feature_series = notebook.available_series(experiment_id)
-
-        if not feature_series:
-            raise ValueError("propose_candidate_expression 需要至少一个 feature_series。")
-
-        record = notebook.experiments[experiment_id]
-        t = notebook.get_series_values(experiment_id, "t")
-        feature_summaries: list[str] = []
-        for series_name in feature_series:
-            values = notebook.get_series_values(experiment_id, series_name)
-            summary = self.data_tool.summarize_series(t=t, values=values, name=series_name)
-            feature_summaries.append(f"- {summary.to_text()}")
-        proposal_feature_series = list(feature_series)
-        if record.config.force_field_type is ForceFieldType.CONSTANT:
-            proposal_feature_series.append("F_ext")
-            feature_summaries.append(
-                f"- F_ext: known constant experimental control = {float(record.config.constant_force):.6f}"
-            )
-
-        force_text = (
-            str(record.config.constant_force)
-            if record.config.force_field_type is ForceFieldType.CONSTANT
-            else "N/A（free 场景无外力，constant_force 参数被忽略）"
-        )
-        experiment_context = (
-            f"实验 {experiment_id}: 场景={record.config.force_field_type.value}, "
-            f"F_ext={force_text}, q0={record.config.initial_q}, v0={record.config.initial_v}, "
-            f"t_span={record.config.t_span}, dt={record.config.dt}。"
-        )
-        notebook_summary = self.brain.summarize_notebook(
-            notebook=notebook,
-            goal="基于当前实验特征量提出一个候选动力学表达式，并由程序验证。",
-            max_steps=max(step_index, len(notebook.action_history) + 1),
-        )
-
-        proposal = self.brain.propose_candidate_expression(
-            notebook_summary=notebook_summary,
-            experiment_context=experiment_context,
-            feature_summaries=feature_summaries,
-            feature_series=proposal_feature_series,
-        )
-        expression = str(proposal["expression"]).strip()
-        if not expression:
-            raise ValueError("LLM 未返回可验证的 expression。")
-
-        output_name = self._make_unique_series_name(
-            notebook,
-            experiment_id,
-            self._normalize_output_name(
-                params.get("output_name") or proposal.get("output_name"),
-                default="llm_candidate",
-            ),
-        )
-        evaluated = self._evaluate_expression(notebook, experiment_id, expression)
-        summary = self.data_tool.summarize_series(t=t, values=evaluated, name=output_name)
-        notebook.register_series(
-            DerivedSeries(
-                experiment_id=experiment_id,
-                name=output_name,
-                values=evaluated,
-                source_name=expression,
-                provenance="LLM candidate expression proposal",
-                summary_text=summary.to_text(),
-            )
-        )
-
-        constancy_score = float(summary.std / (abs(summary.mean) + 1e-8))
-        score = constancy_score
-        expected_relationship = str(proposal.get("expected_relationship", "constant"))
-        force_residual_text = ""
-        if record.config.force_field_type is ForceFieldType.CONSTANT:
-            force_residual = float(summary.mean - float(record.config.constant_force))
-            force_residual_text = f"，与 F_ext 的均值残差为 {force_residual:.6f}"
-            if expected_relationship.strip().lower() in {"external_force", "force", "f_ext"}:
-                score = abs(force_residual) + constancy_score
-
-        rationale = str(proposal.get("rationale", "LLM 基于当前特征量提出候选表达式。"))
-        acceptance_threshold = self._coerce_float(params.get("acceptance_threshold"), 0.08)
-        if score <= acceptance_threshold:
-            notebook.add_candidate_law(
-                CandidateLaw(
-                    expression=expression,
-                    source_experiment_id=experiment_id,
-                    score=score,
-                    origin="propose_candidate_expression",
-                    notes=(
-                        f"features={feature_series}; output_name={output_name}; "
-                        f"expected_relationship={expected_relationship}; rationale={rationale}"
-                    ),
+            evaluated = self._evaluate_expression(notebook, experiment_id, expression)
+            t = notebook.get_series_values(experiment_id, "t")
+            summary = self.data_tool.summarize_series(t=t, values=evaluated, name=output_name)
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=output_name,
+                    values=evaluated,
+                    source_name=expression,
+                    provenance="candidate expression evaluation",
+                    summary_text=summary.to_text(),
                 )
             )
-            candidate_text = "已登记为候选规律"
-        else:
-            notebook.notes.append(
-                f"实验 {experiment_id}: LLM 提出的 `{expression}` 未登记为候选规律，"
-                f"score={score:.6f} 高于阈值 {acceptance_threshold:.6f}。"
+            constancy_score = float(summary.std / (abs(summary.mean) + 1e-8))
+            parts.append(
+                f"{experiment_id}: 表达式 `{expression}` 已求值为 `{output_name}`。"
+                f"{summary.to_text()}。相对波动系数约为 {constancy_score:.6f}，越小表示越接近常数。"
             )
-            candidate_text = (
-                f"未登记为候选规律，因为 score={score:.6f} 高于阈值 "
-                f"{acceptance_threshold:.6f}"
-            )
-        return (
-            f"LLM 提出候选表达式 `{expression}`，并已求值为 `{output_name}`。"
-            f"{summary.to_text()}。相对波动系数约为 {constancy_score:.6f}"
-            f"{force_residual_text}。{candidate_text}。LLM 理由：{rationale}"
-        )
+
+        return self._format_batch_result("批量候选表达式测试完成", parts)
 
     def _action_search_invariants(
         self,
@@ -1348,7 +1264,10 @@ class ScientistAgent:
         requested_ids = params.get("experiment_ids")
 
         if requested_ids:
-            experiment_ids = [self._resolve_experiment_id(notebook, item) for item in requested_ids]
+            experiment_ids = self._resolve_experiment_ids_for_action(
+                notebook,
+                requested_experiment_ids=requested_ids,
+            )
         else:
             experiment_ids = sorted(notebook.experiments.keys())
 
@@ -1438,6 +1357,72 @@ class ScientistAgent:
         notebook.notes.append(summary)
         return summary
 
+    def _action_register_candidate_law(
+        self,
+        notebook: ScientificNotebook,
+        params: dict[str, Any],
+    ) -> str:
+        """把已经通过跨实验验证的表达式登记为候选规律。"""
+        expression = str(params.get("expression", "")).strip()
+        if not expression:
+            if not notebook.generalization_checks:
+                raise ValueError("register_candidate_law 需要 expression，或至少已有一次跨实验验证。")
+            expression = notebook.generalization_checks[-1].expression
+
+        matched_check = self._find_matching_generalization_check(notebook, expression)
+        if matched_check is None:
+            raise ValueError(
+                f"尚未找到表达式 `{expression}` 对应的跨实验验证。"
+                "请先对同一表达式调用 cross_experiment_check，再登记候选规律。"
+            )
+
+        score_threshold = self._coerce_float(params.get("score_threshold"), 0.05)
+        allow_weak = self._coerce_bool(params.get("allow_weak"), False)
+        if matched_check.aggregate_score > score_threshold and not allow_weak:
+            raise ValueError(
+                f"表达式 `{matched_check.expression}` 的跨实验分数 "
+                f"{matched_check.aggregate_score:.6f} 高于阈值 {score_threshold:.6f}，"
+                "暂不登记为候选规律。若只是想保留弱候选，可设置 allow_weak=true。"
+            )
+
+        normalized_expression = self._normalize_expression_for_match(matched_check.expression)
+        for candidate in notebook.candidate_laws:
+            if self._normalize_expression_for_match(candidate.expression) == normalized_expression:
+                return (
+                    f"候选规律 `{candidate.expression}` 已经登记过，"
+                    f"score={candidate.score:.6f}，不重复登记。"
+                )
+
+        source_experiment_id = self._resolve_experiment_id(
+            notebook,
+            params.get("source_experiment_id", params.get("experiment_id", matched_check.experiment_ids[0])),
+        )
+        notes = str(params.get("notes", ""))
+        metric_details = ", ".join(
+            f"{experiment_id}={value:.6f}"
+            for experiment_id, value in matched_check.metric_values.items()
+        )
+        candidate_notes = (
+            f"metric={matched_check.metric_name}; experiments={matched_check.experiment_ids}; "
+            f"aggregate_score={matched_check.aggregate_score:.6f}; details={metric_details}"
+        )
+        if notes:
+            candidate_notes = f"{candidate_notes}; notes={notes}"
+
+        candidate = CandidateLaw(
+            expression=matched_check.expression,
+            source_experiment_id=source_experiment_id,
+            score=matched_check.aggregate_score,
+            origin="register_candidate_law",
+            notes=candidate_notes,
+        )
+        notebook.add_candidate_law(candidate)
+        return (
+            f"已登记候选规律 `{candidate.expression}`。"
+            f"来源实验={source_experiment_id}，score={candidate.score:.6f}，"
+            f"依据={matched_check.summary_text}"
+        )
+
     def _action_finalize_law_guard(
         self,
         notebook: ScientificNotebook,
@@ -1447,7 +1432,7 @@ class ScientistAgent:
             return (
                 "当前禁止结束：尚未形成任何候选规律。请先用 inspect_relationships "
                 "分析变量关系，必要时通过 define_derived_quantity 定义新物理量，"
-                "再通过 propose_candidate_expression 让 LLM 自己提出候选公式，而不是直接总结定律。",
+                "再直接测试并跨实验验证自己提出的候选公式，最后用 register_candidate_law 登记。",
                 False,
             )
         if not notebook.generalization_checks:
@@ -1585,6 +1570,22 @@ class ScientistAgent:
         normalized = re.sub(r"[^0-9A-Za-z_]+", "_", str(value)).strip("_")
         return normalized or "series"
 
+    def _find_matching_generalization_check(
+        self,
+        notebook: ScientificNotebook,
+        expression: str,
+    ) -> GeneralizationCheck | None:
+        """从最近到最早查找同一表达式的跨实验验证。"""
+        normalized_expression = self._normalize_expression_for_match(expression)
+        for check in reversed(notebook.generalization_checks):
+            if self._normalize_expression_for_match(check.expression) == normalized_expression:
+                return check
+        return None
+
+    def _normalize_expression_for_match(self, expression: str) -> str:
+        """用于轻量匹配表达式；不做代数化简，只忽略空白差异。"""
+        return re.sub(r"\s+", "", str(expression))
+
     def _evaluate_expression(
         self,
         notebook: ScientificNotebook,
@@ -1711,6 +1712,49 @@ class ScientistAgent:
         if latest is None:
             raise ValueError("当前还没有任何实验，无法解析 experiment_id。")
         return latest
+
+    def _resolve_experiment_ids_for_action(
+        self,
+        notebook: ScientificNotebook,
+        requested_experiment_ids: Any,
+        fallback_experiment_id: Any = None,
+    ) -> list[str]:
+        """解析支持批处理的 experiment_ids 参数。"""
+        if requested_experiment_ids is None:
+            return [self._resolve_experiment_id(notebook, fallback_experiment_id)]
+
+        if isinstance(requested_experiment_ids, str):
+            raw_text = requested_experiment_ids.strip()
+            if raw_text.lower() in {"all", "*", "全部", "所有"}:
+                experiment_ids = sorted(notebook.experiments.keys())
+            else:
+                experiment_ids = [
+                    item.strip()
+                    for item in raw_text.split(",")
+                    if item.strip()
+                ]
+        else:
+            try:
+                experiment_ids = list(requested_experiment_ids)
+            except TypeError:
+                experiment_ids = [requested_experiment_ids]
+
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for item in experiment_ids:
+            experiment_id = self._resolve_experiment_id(notebook, item)
+            if experiment_id not in seen:
+                resolved.append(experiment_id)
+                seen.add(experiment_id)
+
+        if not resolved:
+            raise ValueError("experiment_ids 为空，无法执行批处理动作。")
+        return resolved
+
+    def _format_batch_result(self, title: str, parts: list[str]) -> str:
+        if len(parts) == 1:
+            return parts[0]
+        return f"{title}（{len(parts)} 个实验）:\n" + "\n".join(f"- {part}" for part in parts)
 
     def _experiment_id_candidates(self, requested_experiment_id: Any) -> list[str]:
         """把 4、'4'、'exp_4'、'exp_04' 都归一化为可匹配的实验 ID。"""
