@@ -16,6 +16,9 @@ except ImportError:  # pragma: no cover
 
 from .processing import DataProcessingTool
 from .reporting import ScientificReporter
+from .code_registry import CodeRegistry
+from .code_runner import GeneratedCodeRunner, GeneratedProcessorResult
+from .data_brain import DataProcessingBrain
 from .universe import (
     ExperimentConfig,
     ExperimentResult,
@@ -251,6 +254,8 @@ class HypothesisBrain:
                     [
                         f"实验 {experiment_id}: 场景={record.config.force_field_type.value}, "
                         f"F_ext={force_text}, q0={record.config.initial_q}, v0={record.config.initial_v}",
+                        f"实验 {experiment_id}: 完整采样 t 序列 = {self._format_numeric_sequence(t)}",
+                        f"实验 {experiment_id}: 完整观测 q(t) 序列 = {self._format_numeric_sequence(q)}",
                         f"实验 {experiment_id}: q 范围 [{np.min(q):.6f}, {np.max(q):.6f}]，"
                         f"线性拟合 MSE={linear_mse:.6e}，二次拟合 MSE={quad_mse:.6e}，三次拟合 MSE={cubic_mse:.6e}",
                         f"实验 {experiment_id}: 可用序列 {notebook.available_series(experiment_id)}",
@@ -285,6 +290,13 @@ class HypothesisBrain:
 
         return "\n".join(lines)
 
+    def _format_numeric_sequence(self, values: np.ndarray) -> str:
+        """Format a full numeric sequence for the decision LLM context."""
+        return json.dumps(
+            [float(f"{float(value):.10g}") for value in values],
+            ensure_ascii=False,
+        )
+
     def plan_next_action(
         self,
         notebook_summary: str,
@@ -316,10 +328,11 @@ class HypothesisBrain:
 7. define_derived_quantity
 8. fit_relationship_model
 9. test_candidate_expression
-10. cross_experiment_check
-11. register_candidate_law
-12. rank_candidate_laws
-13. finalize_law
+10. custom_data_analysis
+11. cross_experiment_check
+12. register_candidate_law
+13. rank_candidate_laws
+14. finalize_law
 
 动作说明：
 - run_experiment: 做一个新实验。参数可包含 initial_q, initial_v, force_field_type, constant_force, t_end, dt, noise_std。force_field_type 可用 free/none/no_force 或 constant/constant_force。
@@ -331,26 +344,29 @@ class HypothesisBrain:
 - define_derived_quantity: 定义一个新的可复用物理量。参数包含 experiment_id 或 experiment_ids, symbol, expression, description, overwrite。symbol 是新物理量名称，expression 是构造公式，可使用已有序列名、实验控制量 F_ext 以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
 - fit_relationship_model: 对一个目标序列做由你指定基函数的最小二乘拟合。参数包含 experiment_id 或 experiment_ids, target_series, basis_expressions, prediction_name, residual_name, include_intercept。basis_expressions 由你给出，例如已有序列、新定义物理量或由它们组成的表达式；工具只返回拟合系数和残差，不自动搜索公式。
 - test_candidate_expression: 测试一个由你提出的表达式是否近似常数。参数包含 experiment_id 或 experiment_ids, expression, output_name。表达式可使用已有序列名以及 square(x), cube(x), sqrt(x), log(x), exp(x), sin(x), cos(x), abs(x)。
-- cross_experiment_check: 在多个实验之间检查同一表达式的稳定性。参数包含 expression, experiment_ids, metric_name。metric_name 当前支持 relative_std、mean_value、force_residual。若要验证表达式是否等于外力，优先使用 force_residual。
-- register_candidate_law: 登记已经通过跨实验验证的候选规律。参数包含 expression, experiment_id 或 source_experiment_id, notes, score_threshold。工具会查找同一表达式最近一次 cross_experiment_check，并用其 aggregate_score 作为候选规律分数；没有跨实验验证时会拒绝登记。
+- custom_data_analysis: 开放式数据分析。参数应包含 analysis_goal（自然语言说明你希望数据处理 LLM 分析什么）、experiment_id 或 experiment_ids、optional_series、expected_outputs。数据处理 LLM 会自行选择代码实现、统计指标、拟合方式、图像和派生序列，并返回 observation。
+- cross_experiment_check: 在多个实验之间检查同一表达式的稳定性。参数包含 expression, experiment_ids, metric_name。metric_name 当前支持 relative_std、mean_value、force_residual。若要验证表达式是否等于外力，优先使用 force_residual。mean_value 只能作为探索性一致性检查，不能单独支撑最终规律。
+- register_candidate_law: 登记已经通过强跨实验验证的候选规律。参数包含 expression, experiment_id 或 source_experiment_id, notes。工具会查找同一表达式最近一次 cross_experiment_check，并用严格内置门槛判断是否允许登记；局部拟合 R² 高、mean_value 一致或用户传入宽松 score_threshold 都不足以登记强候选。
 - rank_candidate_laws: 对已有候选规律做排序和比较。参数可为空。
 - finalize_law: 当你认为证据已经足够时，结束探索并进入定律总结。
 
 规划要求：
 1. 如果还没有实验，先做一个简单基准实验，只观察位置-时间轨迹。
 2. 不要一开始就默认使用任何派生物理量；需要通过观察轨迹后，再决定是否构造变化率或其他序列。
-3. 若你需要速度/加速度，优先用 estimate_kinematics 从 q(t) 同时估计 q_smooth/v/a；只有在特殊情况下才直接对已有序列差分。
-4. 当多个实验都需要同一种处理时，优先用 experiment_ids 批量处理，避免重复单实验步骤。例如一次性对多个 constant 实验 estimate_kinematics、inspect_relationships、define_derived_quantity 或 fit_relationship_model。
-5. 在提出公式前，优先用 inspect_series 和 inspect_relationships 主动观察变量关系。inspect_relationships 每次只能比较两个序列，例如先看 v 与 a，再另起一步看新定义量与 a。
-6. 如果观察到某种组合可能有物理意义，可以先用 define_derived_quantity 给它命名，再用 inspect_relationships 观察这个新量和其他量的关系。
-7. 如果你想检验“某个目标是否可由若干自定义特征解释”，使用 fit_relationship_model，但基函数必须由你基于观察主动指定。
-8. 当你已经看到足够关系线索时，在 thought 中直接提出公式，然后用 test_candidate_expression 和 cross_experiment_check 验证；不要调用不变量搜索、符号回归、枚举搜索、PySR 或额外的公式提案器。
-9. 如果某个解释只在单个实验里成立，不应立刻接受；优先尝试新的实验条件来复验。
-10. 在设计新实验时，尽量改变初始条件、控制参数或对照场景，以增加辨识力。
-11. 不要把“拟合某个控制参数的常数”当作发现定律；更好的做法是先由你基于证据提出候选量，然后再做跨实验验证。
-12. 当某个表达式已经通过跨实验验证且分数足够低，调用 register_candidate_law 把它登记为候选规律。
-13. 若你认为已有证据支持某条规律，可选择 finalize_law，但前提是至少存在一条候选规律和一次跨实验验证。
-14. 总步数上限为 {max_steps}，因此动作要尽量高信息密度。
+3. 数据处理类动作会交给一个独立的数据处理 LLM 写 Python 代码并执行；你只需要决定科学上要处理什么、检验什么，不要在参数里写大段代码。
+4. 默认优先使用 custom_data_analysis 做数据处理、关系观察、拟合、可视化、派生量构造和残差分析。你在 analysis_goal 中用自然语言提出科学问题，让数据处理 LLM 自己决定具体代码。
+5. smooth_series、estimate_kinematics、differentiate_series、inspect_series、inspect_relationships、define_derived_quantity、fit_relationship_model、test_candidate_expression 主要作为兼容旧流程的细粒度动作；除非目标极其简单明确，否则不要优先调用它们。
+6. 当多个实验都需要同一种处理时，custom_data_analysis 也应使用 experiment_ids 批量处理，避免重复单实验步骤。
+7. 在提出公式前，优先让 custom_data_analysis 主动观察变量关系、做图、构造必要派生量、报告残差或拟合指标。
+8. 如果观察到某种组合可能有物理意义，可以让 custom_data_analysis 返回带名称的新派生序列，后续可直接引用它。
+9. 当你已经看到足够关系线索时，在 thought 中直接提出公式，然后用 test_candidate_expression 和 cross_experiment_check 验证；不要调用不变量搜索、符号回归、枚举搜索、PySR 或额外的公式提案器。
+10. 如果某个解释只在单个实验里成立，不应立刻接受；优先尝试新的实验条件来复验。
+11. 在设计新实验时，尽量改变初始条件、控制参数或对照场景，以增加辨识力。
+12. 不要把“拟合某个控制参数的常数”当作发现定律；更好的做法是先由你基于证据提出候选量，然后再做跨实验验证。
+13. 当某个表达式已经通过严格跨实验验证且覆盖了足够多不同条件，调用 register_candidate_law 把它登记为候选规律；不要因为一两个实验局部拟合 R² 很高就登记。
+14. 如果新增实验明显破坏了已登记候选，应继续分析并修正候选，不要 finalize_law。
+15. 若你认为已有证据支持某条规律，可选择 finalize_law，但前提是至少存在一条仍然活跃的强候选规律，且最近的新增实验没有破坏它。
+16. 总步数上限为 {max_steps}，因此动作要尽量高信息密度。
 
 请只返回 JSON：
 {{
@@ -536,13 +552,27 @@ class HypothesisBrain:
 class ScientistAgent:
     """多轮 ReAct 科学发现 Agent。"""
 
+    _STRONG_SUPPORT_THRESHOLDS = {
+        "force_residual": 0.02,
+        "relative_std": 0.03,
+    }
+    _CLEAR_FAILURE_THRESHOLDS = {
+        "force_residual": 0.05,
+        "relative_std": 0.08,
+        "mean_value": 0.10,
+    }
+    _MIN_STRONG_SUPPORT_EXPERIMENTS = 4
+
     def __init__(
         self,
         universe: VirtualUniverse,
         data_tool: DataProcessingTool | None = None,
         verification_engine: VerificationEngine | None = None,
         brain: HypothesisBrain | None = None,
+        data_brain: DataProcessingBrain | None = None,
         reporter: ScientificReporter | None = None,
+        generated_code_dir: str | Path | None = None,
+        use_generated_processors: bool = True,
     ) -> None:
         self.universe = universe
         self.data_tool = data_tool or DataProcessingTool()
@@ -554,7 +584,12 @@ class ScientistAgent:
             maxsize=30,
         )
         self.brain = brain or HypothesisBrain()
+        self.data_brain = data_brain
         self.reporter = reporter or ScientificReporter()
+        self.generated_code_dir = Path(generated_code_dir or (Path.cwd() / "generated_processors"))
+        self.generated_code_runner = GeneratedCodeRunner(self.generated_code_dir)
+        self.generated_code_registry = CodeRegistry(self.generated_code_dir / "registry.json")
+        self.use_generated_processors = use_generated_processors
         self._experiment_counter = 0
 
     def run_scientific_cycle(
@@ -566,6 +601,7 @@ class ScientistAgent:
     ) -> ScientificCycleResult:
         """执行一次真正由 LLM 规划的多轮科学发现循环。"""
         notebook = ScientificNotebook()
+        finished_by_finalize = False
         research_goal = goal or (
             "你只能从时间-位置观测出发，逐步探索这个虚拟宇宙中的运动规律。"
             "这个宇宙是人工构造的，可能不服从经典牛顿力学。"
@@ -607,6 +643,7 @@ class ScientistAgent:
             if progress_callback is not None:
                 progress_callback(action_record)
             if should_finish:
+                finished_by_finalize = True
                 break
 
         final_summary = self.brain.summarize_notebook(
@@ -614,7 +651,10 @@ class ScientistAgent:
             goal=research_goal,
             max_steps=max_steps,
         )
-        final_law = self.brain.synthesize_final_law(final_summary)
+        if finished_by_finalize and self._active_strong_candidate_laws(notebook):
+            final_law = self.brain.synthesize_final_law(final_summary)
+        else:
+            final_law = self._build_inconclusive_law(notebook, finished_by_finalize)
         cycle_result = ScientificCycleResult(
             notebook=notebook,
             final_law=final_law,
@@ -644,21 +684,80 @@ class ScientistAgent:
         if action == "run_experiment":
             return self._action_run_experiment(notebook, params), False
         if action == "smooth_series":
-            return self._action_smooth_series(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_smooth_series(notebook, params),
+            ), False
         if action == "estimate_kinematics":
-            return self._action_estimate_kinematics(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_estimate_kinematics(notebook, params),
+            ), False
         if action == "differentiate_series":
-            return self._action_differentiate_series(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_differentiate_series(notebook, params),
+            ), False
         if action == "inspect_series":
-            return self._action_inspect_series(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_inspect_series(notebook, params),
+            ), False
         if action == "inspect_relationships":
-            return self._action_inspect_relationships(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_inspect_relationships(notebook, params),
+            ), False
         if action == "define_derived_quantity":
-            return self._action_define_derived_quantity(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_define_derived_quantity(notebook, params),
+            ), False
         if action == "fit_relationship_model":
-            return self._action_fit_relationship_model(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_fit_relationship_model(notebook, params),
+            ), False
         if action == "test_candidate_expression":
-            return self._action_test_candidate_expression(notebook, params), False
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: self._action_test_candidate_expression(notebook, params),
+            ), False
+        if action == "custom_data_analysis":
+            return self._execute_generated_data_action(
+                notebook=notebook,
+                step_index=step_index,
+                action=action,
+                params=params,
+                fallback=lambda: (
+                    "custom_data_analysis 需要启用数据处理 LLM 生成代码路径。"
+                    "请设置 USE_GENERATED_PROCESSORS=true 并配置可用的 API。"
+                ),
+            ), False
         if action == "propose_candidate_expression":
             return (
                 "propose_candidate_expression 已从动作菜单中隐藏。请直接在 thought 中提出公式，"
@@ -685,6 +784,220 @@ class ScientistAgent:
 
         return f"未知动作 `{action}`，已忽略。", False
 
+    def _execute_generated_data_action(
+        self,
+        *,
+        notebook: ScientificNotebook,
+        step_index: int,
+        action: str,
+        params: dict[str, Any],
+        fallback: Callable[[], str],
+    ) -> str:
+        """Run a data-processing action through generated code, with legacy fallback."""
+        if not self.use_generated_processors or self.data_brain is None:
+            return fallback()
+
+        description = f"step {step_index}: {action} with params={params}"
+        code_path: Path | None = None
+        try:
+            notebook_context = self._summarize_notebook_for_data_brain(notebook)
+            processor_code = self.data_brain.write_processor_code(
+                action=action,
+                parameters=params,
+                notebook_context=notebook_context,
+                recent_processors=self.generated_code_registry.recent_records(),
+            )
+            code_path = self.generated_code_runner.save_processor(
+                code=processor_code,
+                step_index=step_index,
+                action=action,
+            )
+            payload = self._build_generated_processor_payload(
+                notebook=notebook,
+                action=action,
+                params=params,
+            )
+            result = self.generated_code_runner.run_processor(
+                code_path=code_path,
+                payload=payload,
+            )
+            registered_series = self._register_generated_processor_result(
+                notebook=notebook,
+                result=result,
+                code_path=code_path,
+            )
+            self.generated_code_registry.record_success(
+                step_index=step_index,
+                action=action,
+                code_path=code_path,
+                description=description,
+                observation=result.observation,
+                metrics=result.metrics,
+                derived_series=registered_series,
+                figures=result.figures,
+            )
+            suffix_parts = [f"数据处理代码={code_path}"]
+            if registered_series:
+                suffix_parts.append(f"新增序列={registered_series}")
+            if result.figures:
+                suffix_parts.append(f"图像={result.figures}")
+            return result.observation + "\n" + "；".join(suffix_parts)
+        except Exception as exc:
+            if code_path is not None:
+                self.generated_code_registry.record_failure(
+                    step_index=step_index,
+                    action=action,
+                    code_path=code_path,
+                    description=description,
+                    error=str(exc),
+                )
+            fallback_observation = fallback()
+            return (
+                f"数据处理 LLM 路径失败，已回退到内置工具。失败原因: {exc}\n"
+                f"{fallback_observation}"
+            )
+
+    def _build_generated_processor_payload(
+        self,
+        *,
+        notebook: ScientificNotebook,
+        action: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        output_dir = self.generated_code_dir / "artifacts"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        experiments: dict[str, Any] = {}
+        for experiment_id, record in sorted(notebook.experiments.items()):
+            series_payload: dict[str, list[float]] = {
+                "t": self._array_to_json_list(record.result.t),
+                "q": self._array_to_json_list(record.result.q),
+            }
+            for series_name, series in sorted(notebook.derived_series.get(experiment_id, {}).items()):
+                series_payload[series_name] = self._array_to_json_list(series.values)
+
+            experiments[experiment_id] = {
+                "config": {
+                    "initial_q": record.config.initial_q,
+                    "initial_v": record.config.initial_v,
+                    "force_field_type": record.config.force_field_type.value,
+                    "t_span": list(record.config.t_span),
+                    "dt": record.config.dt,
+                    "noise_std": record.config.noise_std,
+                    "constant_force": record.config.constant_force,
+                },
+                "metadata": dict(record.result.metadata),
+                "available_series": notebook.available_series(experiment_id),
+                "series": series_payload,
+            }
+
+        return {
+            "action": action,
+            "parameters": params,
+            "experiments": experiments,
+            "output_dir": str(output_dir),
+        }
+
+    def _summarize_notebook_for_data_brain(self, notebook: ScientificNotebook) -> str:
+        lines: list[str] = []
+        if not notebook.experiments:
+            return "当前没有实验数据。"
+
+        for experiment_id, record in sorted(notebook.experiments.items()):
+            lines.append(
+                f"{experiment_id}: force_field_type={record.config.force_field_type.value}, "
+                f"F_ext={record.config.constant_force}, q0={record.config.initial_q}, "
+                f"v0={record.config.initial_v}, dt={record.config.dt}, "
+                f"points={len(record.result.t)}"
+            )
+            t = record.result.t
+            for series_name in notebook.available_series(experiment_id):
+                try:
+                    values = notebook.get_series_values(experiment_id, series_name)
+                    summary = self.data_tool.summarize_series(
+                        t=t,
+                        values=values,
+                        name=series_name,
+                    ).to_text()
+                except Exception as exc:
+                    summary = f"{series_name}: 无法摘要 ({exc})"
+                lines.append(f"  - {summary}")
+
+        if notebook.notes:
+            lines.append("最近 notebook notes:")
+            for note in notebook.notes[-8:]:
+                lines.append(f"  - {note}")
+        return "\n".join(lines)
+
+    def _register_generated_processor_result(
+        self,
+        *,
+        notebook: ScientificNotebook,
+        result: GeneratedProcessorResult,
+        code_path: Path,
+    ) -> list[str]:
+        registered_names: list[str] = []
+        for item in result.derived_series:
+            experiment_id = self._resolve_experiment_id(notebook, item.get("experiment_id"))
+            raw_name = item.get("name")
+            if raw_name is None:
+                raise ValueError("generated derived_series 缺少 name。")
+            name = self._normalize_output_name(raw_name, default="generated_series")
+            if name in {"q", "t"}:
+                raise ValueError("generated derived_series 不能覆盖原始序列 q/t。")
+
+            values = self._coerce_generated_series_values(
+                notebook=notebook,
+                experiment_id=experiment_id,
+                values=item.get("values"),
+            )
+            t = notebook.get_series_values(experiment_id, "t")
+            summary_text = self.data_tool.summarize_series(
+                t=t,
+                values=values,
+                name=name,
+            ).to_text()
+            source_name = str(item.get("source_name", f"generated by {code_path.name}"))
+            provenance = str(item.get("provenance", f"generated data processor: {code_path.name}"))
+            notebook.register_series(
+                DerivedSeries(
+                    experiment_id=experiment_id,
+                    name=name,
+                    values=values,
+                    source_name=source_name,
+                    provenance=provenance,
+                    summary_text=summary_text,
+                )
+            )
+            registered_names.append(f"{experiment_id}:{name}")
+
+        if result.metrics:
+            notebook.notes.append(f"生成代码 `{code_path}` 返回 metrics: {result.metrics}")
+        if result.figures:
+            notebook.notes.append(f"生成代码 `{code_path}` 返回 figures: {result.figures}")
+        return registered_names
+
+    def _coerce_generated_series_values(
+        self,
+        *,
+        notebook: ScientificNotebook,
+        experiment_id: str,
+        values: Any,
+    ) -> np.ndarray:
+        if values is None:
+            raise ValueError("generated derived_series 缺少 values。")
+        values_array = np.asarray(values, dtype=float).reshape(-1)
+        expected_length = len(notebook.get_series_values(experiment_id, "t"))
+        if len(values_array) != expected_length:
+            raise ValueError(
+                f"{experiment_id}: generated values 长度 {len(values_array)} "
+                f"与 t 长度 {expected_length} 不一致。"
+            )
+        return values_array
+
+    def _array_to_json_list(self, values: np.ndarray) -> list[float]:
+        values_array = np.asarray(values, dtype=float).reshape(-1)
+        return [float(value) for value in values_array]
+
     def _action_run_experiment(
         self,
         notebook: ScientificNotebook,
@@ -693,11 +1006,12 @@ class ScientistAgent:
         self._experiment_counter += 1
         experiment_id = f"exp_{self._experiment_counter:02d}"
 
+        warnings = self._run_experiment_parameter_warnings(params)
         force_field_type = self._resolve_force_field_type(params.get("force_field_type", "constant"))
 
         config = ExperimentConfig(
-            initial_q=self._coerce_float(params.get("initial_q"), 0.0),
-            initial_v=self._coerce_float(params.get("initial_v"), 1.0),
+            initial_q=self._coerce_float(self._get_first_param(params, "initial_q", "q0"), 0.0),
+            initial_v=self._coerce_float(self._get_first_param(params, "initial_v", "v0"), 1.0),
             force_field_type=force_field_type,
             t_span=(0.0, self._coerce_float(params.get("t_end"), 5.0)),
             dt=self._coerce_float(params.get("dt"), 0.05),
@@ -720,6 +1034,7 @@ class ScientistAgent:
         return (
             f"完成实验 {experiment_id}。场景={config.force_field_type.value}，"
             f"{force_text}，q 范围 [{np.min(result.q):.6f}, {np.max(result.q):.6f}]。"
+            + (f" 参数提示: {'; '.join(warnings)}" if warnings else "")
         )
 
     def _action_smooth_series(
@@ -1334,14 +1649,19 @@ class ScientistAgent:
                 summary_text=summary_text,
             )
         )
-        return summary_text
+        latest_check = notebook.generalization_checks[-1]
+        invalidation_text = self._invalidate_candidates_after_check(notebook, latest_check)
+        return summary_text + invalidation_text
 
     def _action_rank_candidate_laws(self, notebook: ScientificNotebook) -> str:
         """对当前候选规律进行粗略排序。"""
         ranking_items: list[tuple[str, float, str]] = []
 
         for candidate in notebook.candidate_laws:
-            ranking_items.append((candidate.expression, candidate.score, candidate.origin))
+            support = self._latest_matching_generalization_check(notebook, candidate.expression)
+            if support is None or not self._check_is_strong_support(support):
+                continue
+            ranking_items.append((candidate.expression, support.aggregate_score, candidate.origin))
 
         for check in notebook.generalization_checks:
             ranking_items.append((check.expression, check.aggregate_score, "cross_experiment_check"))
@@ -1376,13 +1696,16 @@ class ScientistAgent:
                 "请先对同一表达式调用 cross_experiment_check，再登记候选规律。"
             )
 
-        score_threshold = self._coerce_float(params.get("score_threshold"), 0.05)
         allow_weak = self._coerce_bool(params.get("allow_weak"), False)
-        if matched_check.aggregate_score > score_threshold and not allow_weak:
+        strong_support, support_reason = self._check_strong_support_with_reason(matched_check)
+        if not strong_support and not allow_weak:
             raise ValueError(
-                f"表达式 `{matched_check.expression}` 的跨实验分数 "
-                f"{matched_check.aggregate_score:.6f} 高于阈值 {score_threshold:.6f}，"
-                "暂不登记为候选规律。若只是想保留弱候选，可设置 allow_weak=true。"
+                f"表达式 `{matched_check.expression}` 暂未达到强候选规律门槛："
+                f"{support_reason}。请继续设计更多实验或使用更严格的跨实验验证。"
+            )
+        if allow_weak and not strong_support:
+            notebook.notes.append(
+                f"弱候选 `{matched_check.expression}` 被保留但不允许用于最终规律：{support_reason}"
             )
 
         normalized_expression = self._normalize_expression_for_match(matched_check.expression)
@@ -1404,7 +1727,8 @@ class ScientistAgent:
         )
         candidate_notes = (
             f"metric={matched_check.metric_name}; experiments={matched_check.experiment_ids}; "
-            f"aggregate_score={matched_check.aggregate_score:.6f}; details={metric_details}"
+            f"aggregate_score={matched_check.aggregate_score:.6f}; details={metric_details}; "
+            f"support={'strong' if strong_support else 'weak'}"
         )
         if notes:
             candidate_notes = f"{candidate_notes}; notes={notes}"
@@ -1428,6 +1752,7 @@ class ScientistAgent:
         notebook: ScientificNotebook,
     ) -> tuple[str, bool]:
         """防止 LLM 在证据不足时过早结束。"""
+        active_strong_candidates = self._active_strong_candidate_laws(notebook)
         if not notebook.candidate_laws:
             return (
                 "当前禁止结束：尚未形成任何候选规律。请先用 inspect_relationships "
@@ -1441,8 +1766,43 @@ class ScientistAgent:
                 "检查候选表达式在不同实验条件下是否稳定。",
                 False,
             )
+        if not active_strong_candidates:
+            return (
+                "当前禁止结束：已有候选规律尚未通过强证据门槛，或已被后续失败验证削弱。"
+                "强候选至少需要覆盖足够多的实验，并通过 force_residual 或 relative_std "
+                "这类严格验证；仅 mean_value 一致或局部拟合优度高不能作为最终定律。",
+                False,
+            )
 
         return "LLM 认为当前证据已足够进入规律总结阶段。", True
+
+    def _build_inconclusive_law(
+        self,
+        notebook: ScientificNotebook,
+        finished_by_finalize: bool,
+    ) -> LawHypothesis:
+        reason = (
+            "本轮没有执行通过证据门槛的 finalize_law。"
+            if not finished_by_finalize
+            else "finalize_law 被调用，但没有活跃强候选规律。"
+        )
+        latest_check = notebook.generalization_checks[-1] if notebook.generalization_checks else None
+        evidence = "尚无跨实验验证。"
+        if latest_check is not None:
+            evidence = (
+                f"最近一次跨实验验证为 `{latest_check.expression}`，"
+                f"metric={latest_check.metric_name}, score={latest_check.aggregate_score:.6f}。"
+            )
+        return LawHypothesis(
+            summary=f"当前探索尚未形成可接受的最终定律。{reason}",
+            proposed_law="尚未形成通过强跨实验验证的最终动力学方程。",
+            evidence=evidence,
+            confidence="low",
+            next_steps=(
+                "继续设计能区分局部拟合与真实结构的实验；优先比较多个候选表达式在新增实验、"
+                "不同初速度、不同外力幅度下的泛化表现。"
+            ),
+        )
 
     def _safe_correlation(self, left: np.ndarray, right: np.ndarray) -> float:
         left_array = np.asarray(left, dtype=float)
@@ -1581,6 +1941,107 @@ class ScientistAgent:
             if self._normalize_expression_for_match(check.expression) == normalized_expression:
                 return check
         return None
+
+    def _latest_matching_generalization_check(
+        self,
+        notebook: ScientificNotebook,
+        expression: str,
+    ) -> GeneralizationCheck | None:
+        return self._find_matching_generalization_check(notebook, expression)
+
+    def _active_strong_candidate_laws(self, notebook: ScientificNotebook) -> list[CandidateLaw]:
+        active: list[CandidateLaw] = []
+        for candidate in notebook.candidate_laws:
+            latest_check = self._latest_matching_generalization_check(notebook, candidate.expression)
+            if latest_check is not None and self._check_is_strong_support(latest_check):
+                active.append(candidate)
+        return active
+
+    def _check_is_strong_support(self, check: GeneralizationCheck) -> bool:
+        is_strong, _ = self._check_strong_support_with_reason(check)
+        return is_strong
+
+    def _check_strong_support_with_reason(self, check: GeneralizationCheck) -> tuple[bool, str]:
+        if len(check.experiment_ids) < self._MIN_STRONG_SUPPORT_EXPERIMENTS:
+            return (
+                False,
+                f"实验数量 {len(check.experiment_ids)} 少于强验证要求 "
+                f"{self._MIN_STRONG_SUPPORT_EXPERIMENTS}",
+            )
+
+        threshold = self._STRONG_SUPPORT_THRESHOLDS.get(check.metric_name)
+        if threshold is None:
+            return (
+                False,
+                f"metric `{check.metric_name}` 只能作为探索性证据，不能单独登记强候选",
+            )
+
+        if check.aggregate_score > threshold:
+            return (
+                False,
+                f"aggregate_score={check.aggregate_score:.6f} 高于严格阈值 {threshold:.6f}",
+            )
+
+        if check.metric_name == "force_residual":
+            max_abs_metric = max(abs(value) for value in check.metric_values.values())
+            max_allowed = max(0.03, threshold * 2.5)
+            if max_abs_metric > max_allowed:
+                return (
+                    False,
+                    f"单个实验最大残差 {max_abs_metric:.6f} 高于允许值 {max_allowed:.6f}",
+                )
+
+        if check.metric_name == "relative_std":
+            max_metric = max(check.metric_values.values())
+            max_allowed = max(0.05, threshold * 2.0)
+            if max_metric > max_allowed:
+                return (
+                    False,
+                    f"单个实验最大相对波动 {max_metric:.6f} 高于允许值 {max_allowed:.6f}",
+                )
+
+        return True, "通过强证据门槛"
+
+    def _check_is_clear_failure(self, check: GeneralizationCheck) -> bool:
+        threshold = self._CLEAR_FAILURE_THRESHOLDS.get(check.metric_name)
+        if threshold is None:
+            return False
+        if check.aggregate_score > threshold:
+            return True
+        if check.metric_name == "mean_value":
+            return False
+        if check.metric_name == "force_residual":
+            return max(abs(value) for value in check.metric_values.values()) > max(0.08, threshold * 2.0)
+        return max(abs(value) for value in check.metric_values.values()) > max(0.15, threshold * 2.0)
+
+    def _invalidate_candidates_after_check(
+        self,
+        notebook: ScientificNotebook,
+        check: GeneralizationCheck,
+    ) -> str:
+        """Remove active candidates when a newer check clearly contradicts them."""
+        if not self._check_is_clear_failure(check):
+            return ""
+
+        normalized_expression = self._normalize_expression_for_match(check.expression)
+        remaining_candidates: list[CandidateLaw] = []
+        invalidated: list[CandidateLaw] = []
+        for candidate in notebook.candidate_laws:
+            if self._normalize_expression_for_match(candidate.expression) == normalized_expression:
+                invalidated.append(candidate)
+            else:
+                remaining_candidates.append(candidate)
+
+        if not invalidated:
+            return ""
+
+        notebook.candidate_laws = remaining_candidates
+        message = (
+            f" 后续验证显示表达式 `{check.expression}` 已不满足候选规律要求，"
+            f"已从候选规律列表移除 {len(invalidated)} 条旧登记。"
+        )
+        notebook.notes.append(message)
+        return message
 
     def _normalize_expression_for_match(self, expression: str) -> str:
         """用于轻量匹配表达式；不做代数化简，只忽略空白差异。"""
@@ -1755,6 +2216,45 @@ class ScientistAgent:
         if len(parts) == 1:
             return parts[0]
         return f"{title}（{len(parts)} 个实验）:\n" + "\n".join(f"- {part}" for part in parts)
+
+    def _run_experiment_parameter_warnings(self, params: dict[str, Any]) -> list[str]:
+        allowed_keys = {
+            "initial_q",
+            "q0",
+            "initial_v",
+            "v0",
+            "force_field_type",
+            "constant_force",
+            "t_end",
+            "dt",
+            "noise_std",
+            "experiment_id",
+        }
+        warnings: list[str] = []
+        unknown_keys = sorted(str(key) for key in params if key not in allowed_keys)
+        if unknown_keys:
+            warnings.append(f"run_experiment 收到未知参数 {unknown_keys}，已忽略")
+
+        alias_pairs = [("initial_q", "q0"), ("initial_v", "v0")]
+        for canonical, alias in alias_pairs:
+            if canonical in params and alias in params:
+                canonical_value = params.get(canonical)
+                alias_value = params.get(alias)
+                if canonical_value != alias_value:
+                    warnings.append(
+                        f"`{canonical}` 与别名 `{alias}` 同时出现且取值不同，"
+                        f"已优先使用 `{canonical}`={canonical_value!r}"
+                    )
+                else:
+                    warnings.append(f"`{alias}` 是 `{canonical}` 的别名，两个值相同")
+            elif alias in params:
+                warnings.append(f"已将别名 `{alias}` 解析为 `{canonical}`")
+        return warnings
+
+    def _get_first_param(self, params: dict[str, Any], primary_key: str, alias_key: str) -> Any:
+        if primary_key in params:
+            return params.get(primary_key)
+        return params.get(alias_key)
 
     def _experiment_id_candidates(self, requested_experiment_id: Any) -> list[str]:
         """把 4、'4'、'exp_4'、'exp_04' 都归一化为可匹配的实验 ID。"""

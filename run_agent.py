@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from autonomous_scientist import (
     ActionRecord,
     DataProcessingTool,
+    DataProcessingBrain,
     HypothesisBrain,
     ScientistAgent,
     VerificationEngine,
@@ -87,7 +88,7 @@ def build_agent(api_key: str, model: str, base_url: str | None) -> ScientistAgen
     verification_engine = VerificationEngine(
         niterations=150,
         population_size=50,
-        maxsize=30,
+        maxsize=40,
     )
     brain = HypothesisBrain(
         model=model,
@@ -95,11 +96,21 @@ def build_agent(api_key: str, model: str, base_url: str | None) -> ScientistAgen
         base_url=base_url,
         temperature=0.1,
     )
+    data_brain = DataProcessingBrain(
+        model=os.getenv("DATA_PROCESSING_MODEL", model),
+        api_key=api_key,
+        base_url=os.getenv("DATA_PROCESSING_BASE_URL") or base_url,
+        temperature=float(os.getenv("DATA_PROCESSING_TEMPERATURE", "0.0")),
+    )
     return ScientistAgent(
         universe=universe,
         data_tool=data_tool,
         verification_engine=verification_engine,
         brain=brain,
+        data_brain=data_brain,
+        generated_code_dir=Path.cwd() / "generated_processors",
+        use_generated_processors=os.getenv("USE_GENERATED_PROCESSORS", "true").lower()
+        not in {"0", "false", "no", "n"},
     )
 
 
@@ -140,7 +151,7 @@ def main() -> int:
         log("📘 最终会输出一份包含动作历史、泛化验证和规律总结的 Markdown 科研报告")
         log(DIVIDER)
 
-        max_steps = int(os.getenv("MAX_AGENT_STEPS", "30"))
+        max_steps = int(os.getenv("MAX_AGENT_STEPS", "40"))
         cycle_result = agent.run_scientific_cycle(
             max_steps=max_steps,
             progress_callback=log_agent_step,

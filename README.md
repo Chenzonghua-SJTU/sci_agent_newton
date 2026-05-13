@@ -10,6 +10,7 @@
 - `DataProcessingTool`：对 `q(t)` 进行平滑、求导、构造相空间特征 `q/v/a`。
 - `VerificationEngine`：保留 PySR / 不变量搜索封装，作为可选验证工具；默认自主研究流程不再依赖它提出公式。
 - `HypothesisBrain`：调用兼容 OpenAI SDK 的大模型 API，对轨迹统计摘要进行“物理学家式”判断与反思，并在规划步骤中主动提出可验证的候选公式。
+- `DataProcessingBrain`：第二个专门负责数据处理的大模型 API。决策 LLM 选定数据处理动作后，它会生成 Python 代码、执行分析、保存脚本，并把结构化 observation 返回给决策 LLM。
 - `ScientificReporter`：将一次科研循环导出为 Markdown 报告。
 - `ScientistAgent`：串联实验、分析、回归、反思和报告输出。
 
@@ -20,6 +21,9 @@
 ├── autonomous_scientist/
 │   ├── __init__.py
 │   ├── agent.py
+│   ├── code_registry.py
+│   ├── code_runner.py
+│   ├── data_brain.py
 │   ├── processing.py
 │   ├── reporting.py
 │   ├── universe.py
@@ -125,7 +129,37 @@ OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4.1-mini
 ```
 
-### 2. 运行 Agent
+### 2. 配置数据处理 LLM（可选）
+
+项目现在支持双 LLM 架构：
+
+- 决策 LLM：由 `DEEPSEEK_MODEL` 或 `OPENAI_MODEL` 指定，负责做实验规划、提出 action 和公式。
+- 数据处理 LLM：由 `DATA_PROCESSING_MODEL` 指定，负责为数据处理 action 生成 Python 代码并执行。
+
+如果不额外设置，数据处理 LLM 默认复用决策 LLM 的模型与 base URL。你也可以单独配置：
+
+```env
+DATA_PROCESSING_MODEL=deepseek-v4-flash
+DATA_PROCESSING_TEMPERATURE=0.0
+```
+
+如果需要临时关闭生成代码路径，回到旧版固定函数工具：
+
+```env
+USE_GENERATED_PROCESSORS=false
+```
+
+生成的代码与注册表会保存到：
+
+```text
+generated_processors/
+├── step_005_inspect_relationships.py
+├── step_006_fit_relationship_model.py
+├── artifacts/
+└── registry.json
+```
+
+### 3. 运行 Agent
 
 ```bash
 python run_agent.py
@@ -135,7 +169,8 @@ python run_agent.py
 
 Agent 的公式发现流程现在支持两条路径：
 
-- 默认路径：LLM 先通过 `estimate_kinematics` 从位置轨迹稳健估计速度/加速度，再用 `inspect_series` 和 `inspect_relationships` 逐对观察变量趋势与散点图关系；当它认为某个组合有物理意义时，可用 `define_derived_quantity` 命名并注册中性新物理量，例如 `combo_1 = f(observed_series)`；如果需要检验某组自定义特征是否解释目标序列，可用 `fit_relationship_model` 做最小二乘拟合和残差分析。这些数据处理动作都支持 `experiment_ids` 批量作用于多个实验，避免重复执行单实验步骤。随后 LLM 在自己的规划思考中提出候选表达式，用 `test_candidate_expression` 和 `cross_experiment_check` 进行验证，再用 `register_candidate_law` 登记已通过跨实验验证的候选规律。
+- 默认路径：决策 LLM 优先调用 `custom_data_analysis`，用自然语言说明它希望分析的问题，例如“比较 exp_02/03/04 中加速度与速度平方的关系，并返回必要派生量和残差图”。数据处理 LLM 会自行生成 Python 代码、执行分析、返回 observation、metrics、图像和可复用派生序列。随后决策 LLM 在自己的规划思考中提出候选表达式，用 `test_candidate_expression` 和 `cross_experiment_check` 进行验证，再用 `register_candidate_law` 登记已通过跨实验验证的候选规律。
+- 兼容路径：`estimate_kinematics`、`inspect_series`、`inspect_relationships`、`define_derived_quantity`、`fit_relationship_model` 等细粒度数据处理动作仍然保留，也会优先走数据处理 LLM 生成代码；若生成代码失败，会自动回退到旧版固定函数工具。
 - 旧路径：`search_invariants` 仍保留在代码中作为手动调试/对照工具，但已经从 Agent 的可选动作列表中移除；自主运行时不会再靠不变量枚举或 PySR 替它提出公式。
 
 候选公式提出后，Agent 都需要继续通过 `cross_experiment_check` 在不同实验条件下复验，并通过 `register_candidate_law` 登记候选规律，才允许进入最终规律总结。
