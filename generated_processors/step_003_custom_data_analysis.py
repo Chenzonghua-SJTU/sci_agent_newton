@@ -1,148 +1,105 @@
-import os
-import json
 import numpy as np
-from scipy.signal import savgol_filter
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
 
 def process(payload: dict) -> dict:
-    action = payload.get("action", "custom_data_analysis")
-    params = payload.get("parameters", {})
-    experiments = payload.get("experiments", {})
+    # 仅处理 exp_02
+    exp_id = "exp_02"
+    if exp_id not in payload["experiments"]:
+        raise ValueError(f"Experiment {exp_id} not found in payload")
+    exp = payload["experiments"][exp_id]
+    t = np.array(exp["series"]["t"])
+    q = np.array(exp["series"]["q"])
+    if len(t) != len(q):
+        raise ValueError(f"Length mismatch: t={len(t)}, q={len(q)}")
+    dt = t[1] - t[0]
+    if not np.isclose(dt, float(exp["config"]["dt"]), rtol=1e-6):
+        dt = float(exp["config"]["dt"])
+
+    # 参数
+    window = 5
+    polyorder = 2
+    # 使用 Savitzky-Golay 滤波估计速度和加速度
+    v = savgol_filter(q, window, polyorder, deriv=1, delta=dt)
+    a = savgol_filter(q, window, polyorder, deriv=2, delta=dt)
+
+    # 统计量
+    v_mean = float(np.mean(v))
+    v_std = float(np.std(v, ddof=1))
+    a_mean = float(np.mean(a))
+    a_std = float(np.std(a, ddof=1))
+
+    # 判断是否恒定（阈值 1e-10）
+    v_constant = v_std < 1e-10
+    a_constant = a_std < 1e-10
+
+    # 绘制图像
     output_dir = payload.get("output_dir", ".")
+    fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+    axes[0].plot(t, q, 'b-', label='q')
+    axes[0].set_ylabel('Position')
+    axes[0].grid(True)
+    axes[0].legend()
+    axes[1].plot(t, v, 'r-', label='v')
+    axes[1].set_ylabel('Velocity')
+    axes[1].grid(True)
+    axes[1].legend()
+    axes[2].plot(t, a, 'g-', label='a')
+    axes[2].set_ylabel('Acceleration')
+    axes[2].set_xlabel('Time')
+    axes[2].grid(True)
+    axes[2].legend()
+    fig.suptitle(f'Kinematics for {exp_id}')
+    plt.tight_layout()
+    fig_path = f"{output_dir}/kinematics_{exp_id}.png"
+    fig.savefig(fig_path)
+    plt.close(fig)
 
-    # 确定实验 ID 列表
-    exp_ids = params.get("experiment_ids", None)
-    if exp_ids is None:
-        single_id = params.get("experiment_id", None)
-        if single_id is not None:
-            exp_ids = [single_id]
-        else:
-            exp_ids = list(experiments.keys())
-
-    analysis_goal = params.get("analysis_goal", "")
-    expected_outputs = params.get("expected_outputs", [])
-
-    derived_series = []
-    metrics = {}
-    figures = []
-
-    for eid in exp_ids:
-        if eid not in experiments:
-            continue
-        exp = experiments[eid]
-        series = exp.get("series", {})
-        if "t" not in series or "q" not in series:
-            continue
-        t = np.array(series["t"], dtype=float)
-        q = np.array(series["q"], dtype=float)
-        dt = t[1] - t[0]  # 假设均匀采样
-
-        # 使用中心差分（np.gradient）得到与 t 等长的速度、加速度
-        # 这与题目中“一阶差分（速度）”概念一致，且便于返回派生序列
-        v = np.gradient(q, dt)          # 速度，长度 = len(t)
-        a = np.gradient(v, dt)          # 加速度，长度 = len(t)
-
-        # 统计量
-        v_mean = float(np.mean(v))
-        v_std = float(np.std(v, ddof=1))
-        a_mean = float(np.mean(a))
-        a_std = float(np.std(a, ddof=1))
-
-        # 线性拟合残差 MSE
-        coeffs = np.polyfit(t, q, 1)        # q = slope * t + intercept
-        q_fit = np.polyval(coeffs, t)
-        residual_mse = float(np.mean((q - q_fit)**2))
-
-        # 存储 metrics
-        metrics[f"{eid}_v_mean"] = v_mean
-        metrics[f"{eid}_v_std"] = v_std
-        metrics[f"{eid}_a_mean"] = a_mean
-        metrics[f"{eid}_a_std"] = a_std
-        metrics[f"{eid}_linear_residual_MSE"] = residual_mse
-
-        # 派生序列（中心差分得到的速度和加速度）
-        derived_series.append({
-            "experiment_id": eid,
-            "name": "v_central_diff",
+    # 派生序列
+    derived_series = [
+        {
+            "experiment_id": exp_id,
+            "name": "velocity_series",
             "values": v.tolist(),
-            "source_name": "np.gradient(q, dt)",
-            "provenance": "generated data processor: custom_data_analysis_step",
-            "description": "中心差分估计的速度，长度与t一致"
-        })
-        derived_series.append({
-            "experiment_id": eid,
-            "name": "a_central_diff",
+            "source_name": f"Savgol deriv=1, window={window}, order={polyorder} on q(t)",
+            "provenance": "custom_data_analysis processor",
+            "description": "速度序列（从位置经Savitzky-Golay滤波估计）"
+        },
+        {
+            "experiment_id": exp_id,
+            "name": "acceleration_series",
             "values": a.tolist(),
-            "source_name": "np.gradient(v, dt)",
-            "provenance": "generated data processor: custom_data_analysis_step",
-            "description": "中心差分估计的加速度，长度与t一致"
-        })
+            "source_name": f"Savgol deriv=2, window={window}, order={polyorder} on q(t)",
+            "provenance": "custom_data_analysis processor",
+            "description": "加速度序列（从位置经Savitzky-Golay滤波估计）"
+        }
+    ]
 
-        # 绘图（可选，增加观察丰富性）
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        # q-t
-        axes[0,0].plot(t, q, 'b-', label='q(t)')
-        axes[0,0].plot(t, q_fit, 'r--', label='linear fit')
-        axes[0,0].set_xlabel('t')
-        axes[0,0].set_ylabel('q')
-        axes[0,0].set_title(f'{eid}: q vs t')
-        axes[0,0].legend()
-        axes[0,0].grid(True)
+    # 指标
+    metrics = {
+        "v_mean": v_mean,
+        "v_std": v_std,
+        "a_mean": a_mean,
+        "a_std": a_std,
+        "v_constant": v_constant,
+        "a_constant": a_constant
+    }
 
-        # v-t
-        axes[0,1].plot(t, v, 'g-', label='v (central diff)')
-        axes[0,1].axhline(y=v_mean, color='r', linestyle='--', label=f'mean={v_mean:.6f}')
-        axes[0,1].set_xlabel('t')
-        axes[0,1].set_ylabel('v')
-        axes[0,1].set_title(f'{eid}: v vs t')
-        axes[0,1].legend()
-        axes[0,1].grid(True)
+    # 观察报告
+    observation = (
+        f"对实验 {exp_id}（自由场景, F_ext=0, v0=1）从 q(t) 使用 Savitzky-Golay 滤波 "
+        f"(窗口={window}, 阶数={polyorder}) 估计了速度和加速度。\n"
+        f"速度均值 = {v_mean:.6f}, 标准差 = {v_std:.6e}\n"
+        f"加速度均值 = {a_mean:.6e}, 标准差 = {a_std:.6e}\n"
+        f"速度是否恒定（std<1e-10）: {v_constant}\n"
+        f"加速度是否恒定（std<1e-10）: {a_constant}\n"
+        f"新序列 'velocity_series' 和 'acceleration_series' 已返回。\n"
+        f"图像已保存至 {fig_path}。"
+    )
 
-        # a-t
-        axes[1,0].plot(t, a, 'm-', label='a (central diff)')
-        axes[1,0].axhline(y=a_mean, color='r', linestyle='--', label=f'mean={a_mean:.6f}')
-        axes[1,0].set_xlabel('t')
-        axes[1,0].set_ylabel('a')
-        axes[1,0].set_title(f'{eid}: a vs t')
-        axes[1,0].legend()
-        axes[1,0].grid(True)
-
-        # residual plot
-        residual = q - q_fit
-        axes[1,1].plot(t, residual, 'ko', markersize=2)
-        axes[1,1].axhline(y=0, color='gray', linestyle='--')
-        axes[1,1].set_xlabel('t')
-        axes[1,1].set_ylabel('residual')
-        axes[1,1].set_title(f'{eid}: residual (MSE={residual_mse:.3e})')
-        axes[1,1].grid(True)
-
-        plt.tight_layout()
-        fig_path = os.path.join(output_dir, f"{eid}_kinematics.png")
-        plt.savefig(fig_path, dpi=150)
-        plt.close(fig)
-        figures.append(fig_path)
-
-    # 构建 observation 文本
-    obs_parts = [f"对实验 {exp_ids} 执行自定义数据分析："]
-    obs_parts.append("使用中心差分(np.gradient)从q(t)估计速度v和加速度a序列（长度与t相同），并计算统计量、线性拟合残差MSE。")
-    for eid in exp_ids:
-        if eid not in experiments:
-            continue
-        vm = metrics.get(f"{eid}_v_mean")
-        vs = metrics.get(f"{eid}_v_std")
-        am = metrics.get(f"{eid}_a_mean")
-        as_ = metrics.get(f"{eid}_a_std")
-        rmse = metrics.get(f"{eid}_linear_residual_MSE")
-        obs_parts.append(f"  {eid}: v_mean={vm:.6f}, v_std={vs:.6e}; a_mean={am:.6e}, a_std={as_:.6e}; 线性残差MSE={rmse:.6e}")
-    obs_parts.append("速度/加速度序列和图像已返回，可供后续分析使用。")
-    observation = "\n".join(obs_parts)
-
-    result = {
+    return {
         "observation": observation,
         "derived_series": derived_series,
-        "figures": figures,
+        "figures": [fig_path],
         "metrics": metrics
     }
-    return result

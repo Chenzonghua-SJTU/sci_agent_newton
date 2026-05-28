@@ -1,166 +1,186 @@
-import os
+import json
+import math
+import statistics
+import itertools
+import functools
+import collections
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from numpy.polynomial import Polynomial
 
+# ------------------------------------------------------------
+# 辅助函数：从实验获取 q, t 序列
+# ------------------------------------------------------------
+def _get_q_t(experiment: dict) -> Tuple[np.ndarray, np.ndarray]:
+    series = experiment["series"]
+    if "q" not in series:
+        raise ValueError(f"Experiment {experiment.get('id','?')} missing required series 'q'")
+    if "t" not in series:
+        raise ValueError(f"Experiment {experiment.get('id','?')} missing required series 't'")
+    q = np.array(series["q"], dtype=float)
+    t = np.array(series["t"], dtype=float)
+    if len(q) != len(t):
+        raise ValueError("q and t length mismatch")
+    return q, t
+
+# ------------------------------------------------------------
+# 辅助函数：Savitzky-Golay 求导
+# ------------------------------------------------------------
+def _savgol_derivative(q: np.ndarray, window_length: int, polyorder: int, deriv: int) -> np.ndarray:
+    return savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=deriv, mode='interp')
+
+# ------------------------------------------------------------
+# 主处理函数
+# ------------------------------------------------------------
 def process(payload: dict) -> dict:
     action = payload["action"]
-    params = payload["parameters"]
-    experiments = payload["experiments"]
-    output_dir = payload["output_dir"]
-
-    experiment_ids = params.get("experiment_ids", [])
+    if action != "custom_data_analysis":
+        raise ValueError(f"Expected action 'custom_data_analysis', got '{action}'")
+    
+    parameters = payload["parameters"]
+    experiment_ids = parameters.get("experiment_ids", [])
     if not experiment_ids:
-        experiment_ids = list(experiments.keys())
-
-    analysis_goal = params.get("analysis_goal", "")
-
-    if len(experiment_ids) != 1 or experiment_ids[0] != "exp_04":
-        raise ValueError(f"当前 action 只处理 exp_04，但收到: {experiment_ids}")
-
-    exp_id = "exp_04"
-    exp_data = experiments[exp_id]
-    series = exp_data["series"]
-    config = exp_data["config"]
-
-    t = np.array(series["t"])
-    q = np.array(series["q"])
-
-    if len(t) != len(q):
-        raise ValueError(f"t 和 q 长度不一致: {len(t)} vs {len(q)}")
-
-    dt = config.get("dt")
-    if dt is None:
-        dt = t[1] - t[0] if len(t) > 1 else 1.0
-
-    # 中心差分计算速度和加速度
-    v = np.gradient(q, dt)
-    a = np.gradient(v, dt)
-
-    # 加速度统计
-    a_mean = float(np.mean(a))
-    a_std = float(np.std(a, ddof=0))
-
-    # 检查加速度是否接近常数：如果标准差相对于均值（绝对值）很小，或者绝对值很小则视为常数
-    # 只报告数值，不做判定
-    if abs(a_mean) > 1e-12:
-        rel_std = a_std / abs(a_mean)
-    else:
-        rel_std = a_std  # 均值接近0时用绝对值
-
-    # q 对 t^2 的线性拟合
-    t2 = t ** 2
-    coeff_t2 = np.polyfit(t2, q, 1)  # [slope, intercept]
-    slope_t2 = float(coeff_t2[0])
-    intercept_t2 = float(coeff_t2[1])
-    q_pred_t2 = np.polyval(coeff_t2, t2)
-    residual_t2 = q - q_pred_t2
-    mse_t2 = float(np.mean(residual_t2 ** 2))
-    rmse_t2 = float(np.sqrt(mse_t2))
-
-    # q 对 t 的二次多项式拟合
-    coeff_quad = np.polyfit(t, q, 2)  # [a2, a1, a0]
-    q_pred_quad = np.polyval(coeff_quad, t)
-    residual_quad = q - q_pred_quad
-    mse_quad = float(np.mean(residual_quad ** 2))
-    rmse_quad = float(np.sqrt(mse_quad))
-
-    # 构建派生序列
-    derived_series = [
-        {
-            "experiment_id": exp_id,
-            "name": "v_central_diff",
-            "values": v.tolist(),
-            "source_name": "np.gradient(q, dt)",
+        raise ValueError("Missing 'experiment_ids' in parameters")
+    
+    # 验证需要的实验存在
+    experiments = payload["experiments"]
+    for eid in experiment_ids:
+        if eid not in experiments:
+            raise ValueError(f"Experiment {eid} not found in payload")
+    
+    output_dir = Path(payload["output_dir"])
+    derived_series_list = []
+    metrics = {}
+    figures = []
+    observations = []
+    
+    # 固定 SG 参数
+    window_length = 7
+    polyorder = 2
+    
+    for eid in experiment_ids:
+        exp = experiments[eid]
+        q, t = _get_q_t(exp)
+        config = exp.get("config", {})
+        F_ext = config.get("F_ext", 0.0)
+        
+        # 计算 v_sg 和 a_sg
+        v_sg = _savgol_derivative(q, window_length, polyorder, deriv=1)
+        a_sg = _savgol_derivative(q, window_length, polyorder, deriv=2)
+        
+        # 线性拟合 a = intercept + slope * v
+        v = v_sg
+        a = a_sg
+        # 使用 numpy polyfit
+        coeffs = np.polyfit(v, a, 1)   # [slope, intercept]
+        slope = coeffs[0]
+        intercept = coeffs[1]
+        a_pred = np.polyval(coeffs, v)
+        residuals = a - a_pred
+        rmse = np.sqrt(np.mean(residuals**2))
+        r2 = 1.0 - np.sum(residuals**2) / np.sum((a - np.mean(a))**2)
+        
+        # 加速度统计
+        a_mean = float(np.mean(a))
+        a_std = float(np.std(a, ddof=0))
+        
+        # 计算 a + (-slope)*v = a - slope*v
+        a_minus_slope_v = a - slope * v
+        amv_mean = float(np.mean(a_minus_slope_v))
+        amv_std = float(np.std(a_minus_slope_v, ddof=0))
+        
+        # 检查 a_minus_slope_v 是否接近常数（std 相对均值很小）并且接近 F_ext
+        is_constant_flag = (amv_std < 1e-10) or (amv_std / (abs(amv_mean)+1e-20) < 0.01)
+        diff_from_F_ext = abs(amv_mean - F_ext)
+        
+        # 构建实验 metrics 前缀
+        obs_parts = []
+        obs_parts.append(f"实验 {eid}:")
+        obs_parts.append(f"SG滤波(window={window_length}, polyorder={polyorder}) 从 q 估计 v_sg 和 a_sg")
+        obs_parts.append(f"v_sg: min={np.min(v_sg):.6f}, max={np.max(v_sg):.6f}, mean={np.mean(v_sg):.6f}, std={np.std(v_sg, ddof=0):.6f}")
+        obs_parts.append(f"a_sg: min={np.min(a_sg):.6f}, max={np.max(a_sg):.6f}, mean={a_mean:.6f}, std={a_std:.6f}")
+        obs_parts.append(f"线性拟合 a = {intercept:.6f} + ({slope:.6f})*v  | RMSE={rmse:.6f}, R²={r2:.6f}")
+        obs_parts.append(f"a + (-{slope:.6f})*v 均值={amv_mean:.6f}, 标准差={amv_std:.6f}, 与 F_ext={F_ext} 的偏差={diff_from_F_ext:.6f}")
+        if is_constant_flag:
+            obs_parts.append("该残差序列接近常数")
+        else:
+            obs_parts.append("该残差序列不接近常数")
+        
+        observations.append("\n".join(obs_parts))
+        
+        # 保存 metrics
+        prefix = f"{eid}_"
+        metrics[prefix+"v_sg_min"] = float(np.min(v_sg))
+        metrics[prefix+"v_sg_max"] = float(np.max(v_sg))
+        metrics[prefix+"v_sg_mean"] = float(np.mean(v_sg))
+        metrics[prefix+"v_sg_std"] = float(np.std(v_sg, ddof=0))
+        metrics[prefix+"a_sg_min"] = float(np.min(a_sg))
+        metrics[prefix+"a_sg_max"] = float(np.max(a_sg))
+        metrics[prefix+"a_sg_mean"] = a_mean
+        metrics[prefix+"a_sg_std"] = a_std
+        metrics[prefix+"linear_slope"] = float(slope)
+        metrics[prefix+"linear_intercept"] = float(intercept)
+        metrics[prefix+"linear_rmse"] = float(rmse)
+        metrics[prefix+"linear_r2"] = float(r2)
+        metrics[prefix+"amv_mean"] = amv_mean
+        metrics[prefix+"amv_std"] = amv_std
+        metrics[prefix+"amv_diff_from_F_ext"] = diff_from_F_ext
+        metrics[prefix+"amv_is_constant"] = is_constant_flag
+        
+        # 派生序列
+        derived_series_list.append({
+            "experiment_id": eid,
+            "name": "v_sg",
+            "values": v_sg.tolist(),
+            "source_name": f"Savitzky-Golay deriv=1 (window={window_length}, polyorder={polyorder}) on q",
             "provenance": "generated data processor: custom_data_analysis",
-            "description": "中心差分法估计的速度序列"
-        },
-        {
-            "experiment_id": exp_id,
-            "name": "a_central_diff",
-            "values": a.tolist(),
-            "source_name": "np.gradient(v, dt)",
+            "description": f"速度估计，对 {eid} 的 q 做 SG 滤波一阶导数"
+        })
+        derived_series_list.append({
+            "experiment_id": eid,
+            "name": "a_sg",
+            "values": a_sg.tolist(),
+            "source_name": f"Savitzky-Golay deriv=2 (window={window_length}, polyorder={polyorder}) on q",
             "provenance": "generated data processor: custom_data_analysis",
-            "description": "中心差分法估计的加速度序列"
-        }
-    ]
-
-    # 画图
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    # q-t
-    axes[0, 0].plot(t, q, 'b-', label='q(t)')
-    axes[0, 0].set_xlabel('t')
-    axes[0, 0].set_ylabel('q')
-    axes[0, 0].set_title('Position vs Time')
-    axes[0, 0].grid(True)
-
-    # v-t
-    axes[0, 1].plot(t, v, 'g-', label='v (central diff)')
-    axes[0, 1].set_xlabel('t')
-    axes[0, 1].set_ylabel('v')
-    axes[0, 1].set_title('Velocity vs Time')
-    axes[0, 1].grid(True)
-
-    # a-t
-    axes[1, 0].plot(t, a, 'r-', label='a (central diff)')
-    axes[1, 0].axhline(y=a_mean, color='k', linestyle='--', label=f'mean={a_mean:.4f}')
-    axes[1, 0].set_xlabel('t')
-    axes[1, 0].set_ylabel('a')
-    axes[1, 0].set_title(f'Acceleration vs Time (std={a_std:.4f})')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True)
-
-    # q vs t^2 拟合与二次拟合对比
-    axes[1, 1].scatter(t, q, s=10, color='blue', label='data', alpha=0.6)
-    axes[1, 1].plot(t, q_pred_t2, 'r-', label=f'linear t^2 fit (slope={slope_t2:.4f})')
-    axes[1, 1].plot(t, q_pred_quad, 'g--', label=f'quadratic fit')
-    axes[1, 1].set_xlabel('t')
-    axes[1, 1].set_ylabel('q')
-    axes[1, 1].set_title('Fits')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True)
-
-    plt.tight_layout()
-    fig_path = os.path.join(output_dir, f"{exp_id}_kinematics_fits.png")
-    plt.savefig(fig_path, dpi=150)
-    plt.close(fig)
-
-    # 返回 metrics
-    metrics = {
-        f"{exp_id}_a_mean": a_mean,
-        f"{exp_id}_a_std": a_std,
-        f"{exp_id}_a_rel_std": rel_std,
-        f"{exp_id}_linear_t2_slope": slope_t2,
-        f"{exp_id}_linear_t2_intercept": intercept_t2,
-        f"{exp_id}_linear_t2_mse": mse_t2,
-        f"{exp_id}_linear_t2_rmse": rmse_t2,
-        f"{exp_id}_quadratic_coeff_a2": float(coeff_quad[0]),
-        f"{exp_id}_quadratic_coeff_a1": float(coeff_quad[1]),
-        f"{exp_id}_quadratic_coeff_a0": float(coeff_quad[2]),
-        f"{exp_id}_quadratic_mse": mse_quad,
-        f"{exp_id}_quadratic_rmse": rmse_quad,
-        "window_length": len(t),
-        "method": "central_difference"
-    }
-
-    observation = (
-        f"对实验 {exp_id} (constant force, F_ext={config.get('constant_force', 'N/A')}, "
-        f"q0={config.get('initial_q', 'N/A')}, v0={config.get('initial_v', 'N/A')}) "
-        f"的位置序列 q(t) 进行了运动学分析。\n"
-        f"使用中心差分法 (np.gradient, dt={dt}) 估计速度和加速度序列。\n"
-        f"加速度均值 = {a_mean:.6f}, 标准差 = {a_std:.6f}, 相对标准差 = {rel_std:.6f}。\n"
-        f"q(t) 对 t^2 的线性拟合斜率 = {slope_t2:.6f}, 截距 = {intercept_t2:.6f}, "
-        f"MSE = {mse_t2:.6e}, RMSE = {rmse_t2:.6e}。\n"
-        f"二次多项式拟合系数: a2={coeff_quad[0]:.6f}, a1={coeff_quad[1]:.6f}, a0={coeff_quad[2]:.6f}, "
-        f"MSE = {mse_quad:.6e}, RMSE = {rmse_quad:.6e}。\n"
-        f"已生成派生序列 v_central_diff, a_central_diff 及运动学拟合图。"
-    )
-
-    return {
+            "description": f"加速度估计，对 {eid} 的 q 做 SG 滤波二阶导数"
+        })
+        
+        # 绘制 a vs v 散点图及拟合线
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.scatter(v, a, label="Data", alpha=0.7, s=20)
+        # 绘制拟合线
+        v_sorted = np.sort(v)
+        a_fit_line = np.polyval(coeffs, v_sorted)
+        ax.plot(v_sorted, a_fit_line, 'r-', label=f"Fit: a={intercept:.4f}+{slope:.4f}*v")
+        ax.set_xlabel("v (velocity)")
+        ax.set_ylabel("a (acceleration)")
+        ax.set_title(f"Experiment {eid}: a vs v (SG smoothed)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        # 添加统计文本
+        textstr = f"RMSE={rmse:.4f}\nR²={r2:.4f}"
+        ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        fig.tight_layout()
+        fig_path = output_dir / f"a_vs_v_fit_{eid}.png"
+        fig.savefig(fig_path, dpi=150)
+        plt.close(fig)
+        figures.append(str(fig_path))
+        
+        # 也可画 a_minus_slope_v 随时间变化？但未明确要求，省略
+    
+    observation = "\n\n".join(observations)
+    result = {
         "observation": observation,
-        "derived_series": derived_series,
-        "figures": [fig_path],
+        "derived_series": derived_series_list,
+        "figures": figures,
         "metrics": metrics
     }
+    return result

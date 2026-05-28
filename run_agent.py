@@ -8,11 +8,9 @@ from dotenv import load_dotenv
 
 from autonomous_scientist import (
     ActionRecord,
-    DataProcessingTool,
     DataProcessingBrain,
     HypothesisBrain,
     ScientistAgent,
-    VerificationEngine,
     VirtualUniverse,
 )
 
@@ -81,42 +79,32 @@ def build_agent(api_key: str, model: str, base_url: str | None) -> ScientistAgen
         base_mass=1.0,
         random_seed=42,
     )
-    data_tool = DataProcessingTool(
-        window_length= nine_point_window(),
-        polyorder=3,
-    )
-    verification_engine = VerificationEngine(
-        niterations=150,
-        population_size=50,
-        maxsize=40,
-    )
     brain = HypothesisBrain(
         model=model,
         api_key=api_key,
         base_url=base_url,
         temperature=0.1,
+        timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "90")),
     )
     data_brain = DataProcessingBrain(
         model=os.getenv("DATA_PROCESSING_MODEL", model),
         api_key=api_key,
         base_url=os.getenv("DATA_PROCESSING_BASE_URL") or base_url,
         temperature=float(os.getenv("DATA_PROCESSING_TEMPERATURE", "0.0")),
+        timeout_seconds=float(
+            os.getenv("DATA_PROCESSING_TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+        ),
     )
     return ScientistAgent(
         universe=universe,
-        data_tool=data_tool,
-        verification_engine=verification_engine,
         brain=brain,
         data_brain=data_brain,
         generated_code_dir=Path.cwd() / "generated_processors",
         use_generated_processors=os.getenv("USE_GENERATED_PROCESSORS", "true").lower()
         not in {"0", "false", "no", "n"},
+        allow_data_processing_fallback=os.getenv("ALLOW_DATA_PROCESSING_FALLBACK", "false").lower()
+        in {"1", "true", "yes", "y"},
     )
-
-
-def nine_point_window() -> int:
-    """单独抽出窗口配置，便于后续脚本层调参。"""
-    return 9
 
 
 def log_agent_step(action_record: ActionRecord) -> None:
@@ -146,9 +134,9 @@ def main() -> int:
 
         log(DIVIDER)
         log("🧪 实验任务：Agent 只能从时间-位置数据出发，自主决定下一步实验与分析动作")
-        log("🧠 LLM 将逐步规划：是否做新实验、是否平滑、是否求导、是否主动提出候选公式")
-        log("🔁 当出现候选规律后，Agent 会尝试在不同初速度/不同外力下做跨实验复验")
-        log("📘 最终会输出一份包含动作历史、泛化验证和规律总结的 Markdown 科研报告")
+        log("🧠 LLM 将维护实验数据记录表：原始 q,t、派生物理量、OBS 观察和 VAL 验证")
+        log("🔁 当出现候选规律后，Agent 会用数据处理 LLM 做单实验或跨实验验证")
+        log("📘 最终会输出一份包含动作历史、数据记录表、假说表和规律总结的 Markdown 科研报告")
         log(DIVIDER)
 
         max_steps = int(os.getenv("MAX_AGENT_STEPS", "40"))
@@ -180,34 +168,23 @@ def main() -> int:
             )
             log(f"Observation: {action_record.observation}")
         log(DIVIDER)
-        if cycle_result.notebook.invariant_history:
-            latest = cycle_result.notebook.invariant_history[-1]
-            log("【最新不变量搜索结果】")
-            log(f"候选表达式: {latest.equation}")
-            log(f"Score: {latest.score:.12f}")
-            log(f"Residual Std: {latest.residual_std:.12f}")
-            if latest.complexity is not None:
-                log(f"Complexity: {latest.complexity:.6f}")
-            else:
-                log("Complexity: N/A")
+        if cycle_result.notebook.observations:
+            log("【实验数据记录表 OBS】")
+            for observation in cycle_result.notebook.observations[-5:]:
+                log(f"{observation.observation_id}: {observation.summary}")
             log(DIVIDER)
-        if cycle_result.notebook.generalization_checks:
-            latest_check = cycle_result.notebook.generalization_checks[-1]
-            log("【最新跨实验验证】")
-            log(f"Expression: {latest_check.expression}")
-            log(f"Experiments: {latest_check.experiment_ids}")
-            log(f"Metric: {latest_check.metric_name}")
-            log(f"Aggregate Score: {latest_check.aggregate_score:.6f}")
-            log(f"Summary: {latest_check.summary_text}")
-            log(DIVIDER)
-        if cycle_result.notebook.candidate_laws:
-            ranked = sorted(cycle_result.notebook.candidate_laws, key=lambda item: item.score)
-            log("【候选规律排序】")
-            for candidate in ranked[:5]:
+        if cycle_result.notebook.validations:
+            log("【实验数据记录表 VAL】")
+            for validation in cycle_result.notebook.validations[-5:]:
+                verdict = "supports" if validation.supports else "refutes"
                 log(
-                    f"{candidate.expression} | score={candidate.score:.6f} | "
-                    f"origin={candidate.origin} | exp={candidate.source_experiment_id}"
+                    f"{validation.validation_id}: {verdict} {validation.hypothesis_id} | "
+                    f"metric={validation.metric_name} | score={validation.aggregate_score}"
                 )
+            log(DIVIDER)
+        if cycle_result.notebook.hypothesis_registry.all_records():
+            log("【候选规律账本】")
+            log(cycle_result.notebook.hypothesis_registry.summarize_for_prompt(limit=10))
             log(DIVIDER)
         log("【最终规律总结】")
         log(f"Summary: {cycle_result.final_law.summary}")
@@ -233,7 +210,7 @@ def main() -> int:
         log("❌ 自主科研 Agent 运行失败。")
         log(f"错误信息: {exc}")
         log(
-            "排查建议：确认已安装 `openai`, `numpy`, `scipy`, `pandas`, `pysr`，"
+            "排查建议：确认已安装 `openai`, `numpy`, `scipy`, `pandas`，"
             "并确保 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY` 已正确设置。"
         )
         log(DIVIDER)

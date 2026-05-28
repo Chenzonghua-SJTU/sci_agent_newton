@@ -1,117 +1,129 @@
+import os
 import numpy as np
 from scipy.signal import savgol_filter
-import warnings
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from typing import List, Dict, Any
 
 def process(payload: dict) -> dict:
-    # --- 参数解析 ---
-    params = payload["parameters"]
-    exp_id = params["experiment_id"]
-    source_series_name = params["source_series"]          # 原始位置序列名
-    position_name = params["position_name"]                # 输出的位置（平滑后）序列名
-    velocity_name = params["velocity_name"]                # 输出的速度序列名
-    acceleration_name = params["acceleration_name"]        # 输出的加速度序列名
-    window_length = int(params["window_length"])
-    polyorder = int(params["polyorder"])
-    overwrite = params.get("overwrite", False)
+    action = payload.get("action", "")
+    params = payload.get("parameters", {})
+    experiments = payload.get("experiments", {})
+    output_dir = payload.get("output_dir", ".")
 
-    # --- 获取实验数据 ---
-    if exp_id not in payload["experiments"]:
-        raise ValueError(f"实验 {exp_id} 不存在于 payload 中")
-    exp = payload["experiments"][exp_id]
+    # 确定要处理的实验 ID
+    exp_id = params.get("experiment_id", "")
+    if not exp_id:
+        raise ValueError("parameters must contain 'experiment_id' for estimate_kinematics action")
+    if exp_id not in experiments:
+        raise ValueError(f"Experiment '{exp_id}' not found in payload['experiments']")
 
-    if source_series_name not in exp["series"]:
-        raise ValueError(f"源序列 {source_series_name} 在实验 {exp_id} 中不存在")
-    q = np.array(exp["series"][source_series_name], dtype=float)
+    exp_data = experiments[exp_id]
+    series = exp_data.get("series", {})
+    config = exp_data.get("config", {})
+    t = np.array(series.get("t", []))
+    q = np.array(series.get(params.get("source_series", "q"), []))
 
-    if "t" not in exp["series"]:
-        raise ValueError(f"时间序列 t 在实验 {exp_id} 中不存在")
-    t = np.array(exp["series"]["t"], dtype=float)
+    if len(t) == 0 or len(q) == 0:
+        raise ValueError(f"Required series 't' and '{params['source_series']}' not found for {exp_id}")
 
-    n = len(q)
-    if n < window_length:
-        raise ValueError(f"序列长度 {n} 小于窗口长度 {window_length}")
+    window_length = int(params.get("window_length", 11))
+    polyorder = int(params.get("polyorder", 3))
+    position_name = params.get("position_name", "q_smooth")
+    velocity_name = params.get("velocity_name", "v_sg")
+    acceleration_name = params.get("acceleration_name", "a_sg")
 
-    # --- 时间步长（假设均匀） ---
-    dt = t[1] - t[0]
-    if dt <= 0:
-        raise ValueError("时间步长必须为正")
+    if window_length % 2 == 0:
+        window_length += 1  # must be odd
+    if polyorder >= window_length:
+        polyorder = window_length - 1
 
-    # --- 使用 Savitzky-Golay 滤波计算导数 ---
-    q_smooth = savgol_filter(q, window_length, polyorder, deriv=0)
-    v = savgol_filter(q, window_length, polyorder, deriv=1) / dt
-    a = savgol_filter(q, window_length, polyorder, deriv=2) / (dt ** 2)
+    # 计算平滑位置、速度、加速度
+    q_smooth = savgol_filter(q, window_length, polyorder, deriv=0, mode='nearest')
+    v = savgol_filter(q, window_length, polyorder, deriv=1, delta=config.get("dt", t[1]-t[0] if len(t)>1 else 0.1), mode='nearest')
+    a = savgol_filter(q, window_length, polyorder, deriv=2, delta=config.get("dt", t[1]-t[0] if len(t)>1 else 0.1), mode='nearest')
 
-    # --- 构建结果数据 ---
-    # 源信息文本
-    source_desc = (f"Savitzky-Golay filter (window={window_length}, poly={polyorder}) "
-                   f"on {exp_id}:{source_series_name}")
-
-    derived_series = []
-
-    # 位置序列（平滑后）
-    derived_series.append({
-        "experiment_id": exp_id,
-        "name": position_name,
-        "values": q_smooth.tolist(),
-        "source_name": source_desc,
-        "provenance": "generated data processor: estimate_kinematics",
-        "description": f"Smoothed position via SG filter (win={window_length}, poly={polyorder})"
-    })
-
-    # 速度序列
-    derived_series.append({
-        "experiment_id": exp_id,
-        "name": velocity_name,
-        "values": v.tolist(),
-        "source_name": source_desc,
-        "provenance": "generated data processor: estimate_kinematics",
-        "description": f"Velocity estimated as 1st derivative of {source_series_name} (SG filter)"
-    })
-
-    # 加速度序列
-    derived_series.append({
-        "experiment_id": exp_id,
-        "name": acceleration_name,
-        "values": a.tolist(),
-        "source_name": source_desc,
-        "provenance": "generated data processor: estimate_kinematics",
-        "description": f"Acceleration estimated as 2nd derivative of {source_series_name} (SG filter)"
-    })
-
-    # --- 统计信息用于 observation & metrics ---
-    def stats(arr, name):
+    # 统计指标
+    def stats(arr, name_prefix=""):
         return {
-            f"{name}_min": float(np.min(arr)),
-            f"{name}_max": float(np.max(arr)),
-            f"{name}_mean": float(np.mean(arr)),
-            f"{name}_std": float(np.std(arr)),
-            f"{name}_start": float(arr[0]),
-            f"{name}_end": float(arr[-1]),
-            f"{name}_slope": float((arr[-1] - arr[0]) / (t[-1] - t[0])) if len(arr) >= 2 else float('nan')
+            f"{name_prefix}min": float(np.min(arr)),
+            f"{name_prefix}max": float(np.max(arr)),
+            f"{name_prefix}mean": float(np.mean(arr)),
+            f"{name_prefix}std": float(np.std(arr)),
+            f"{name_prefix}start": float(arr[0]),
+            f"{name_prefix}end": float(arr[-1])
         }
 
     metrics = {}
-    metrics.update(stats(q_smooth, position_name))
-    metrics.update(stats(v, velocity_name))
-    metrics.update(stats(a, acceleration_name))
+    metrics.update({f"{exp_id}_{position_name}_" + k: v for k, v in stats(q_smooth).items()})
+    metrics.update({f"{exp_id}_{velocity_name}_" + k: v for k, v in stats(v, "v_").items()})
+    metrics.update({f"{exp_id}_{acceleration_name}_" + k: v for k, v in stats(a, "a_").items()})
+    metrics["window_length"] = window_length
+    metrics["polyorder"] = polyorder
 
-    observation = (
-        f"实验 {exp_id}: 从序列 {source_series_name} 使用 Savitzky-Golay 滤波 "
-        f"(窗口={window_length}, 多项式阶数={polyorder}) 估计得到位置（平滑后）、速度、加速度序列。\n"
-        f"位置序列 {position_name}: 均值={metrics[f'{position_name}_mean']:.6f}, "
-        f"范围=[{metrics[f'{position_name}_min']:.6f}, {metrics[f'{position_name}_max']:.6f}], "
-        f"起点={metrics[f'{position_name}_start']:.6f}, 终点={metrics[f'{position_name}_end']:.6f}\n"
-        f"速度序列 {velocity_name}: 均值={metrics[f'{velocity_name}_mean']:.6f}, "
-        f"范围=[{metrics[f'{velocity_name}_min']:.6f}, {metrics[f'{velocity_name}_max']:.6f}], "
-        f"起点={metrics[f'{velocity_name}_start']:.6f}, 终点={metrics[f'{velocity_name}_end']:.6f}\n"
-        f"加速度序列 {acceleration_name}: 均值={metrics[f'{acceleration_name}_mean']:.6f}, "
-        f"范围=[{metrics[f'{acceleration_name}_min']:.6f}, {metrics[f'{acceleration_name}_max']:.6f}], "
-        f"起点={metrics[f'{acceleration_name}_start']:.6f}, 终点={metrics[f'{acceleration_name}_end']:.6f}"
-    )
+    # 保存图像
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    axes[0].plot(t, q_smooth, label="q_smooth", color='blue')
+    axes[0].set_ylabel("Position")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(t, v, label="v_sg", color='green')
+    axes[1].set_ylabel("Velocity")
+    axes[1].legend()
+    axes[1].grid(True)
+
+    axes[2].plot(t, a, label="a_sg", color='red')
+    axes[2].set_xlabel("Time")
+    axes[2].set_ylabel("Acceleration")
+    axes[2].legend()
+    axes[2].grid(True)
+
+    fig.suptitle(f"Kinematics estimation for {exp_id} (SG window={window_length}, poly={polyorder})")
+    figure_path = os.path.join(output_dir, f"kinematics_{exp_id}.png")
+    plt.tight_layout()
+    plt.savefig(figure_path, dpi=150)
+    plt.close(fig)
+
+    # 派生序列
+    derived_series = [
+        {
+            "experiment_id": exp_id,
+            "name": position_name,
+            "values": q_smooth.tolist(),
+            "source_name": f"savgol_filter(q, window={window_length}, poly={polyorder}, deriv=0)",
+            "provenance": f"generated data processor: {action} (step estimate_kinematics)",
+            "description": "Smoothed position using Savitzky-Golay filter"
+        },
+        {
+            "experiment_id": exp_id,
+            "name": velocity_name,
+            "values": v.tolist(),
+            "source_name": f"savgol_filter(q, window={window_length}, poly={polyorder}, deriv=1)",
+            "provenance": f"generated data processor: {action} (step estimate_kinematics)",
+            "description": "Estimated velocity via Savitzky-Golay derivative"
+        },
+        {
+            "experiment_id": exp_id,
+            "name": acceleration_name,
+            "values": a.tolist(),
+            "source_name": f"savgol_filter(q, window={window_length}, poly={polyorder}, deriv=2)",
+            "provenance": f"generated data processor: {action} (step estimate_kinematics)",
+            "description": "Estimated acceleration via Savitzky-Golay second derivative"
+        }
+    ]
+
+    # 构建观察字符串
+    obs = f"运动学估计完成。实验 {exp_id}：使用 Savitzky-Golay 滤波器（窗口 {window_length}，多项式阶 {polyorder}）从 {params['source_series']} 估计了平滑位置 {position_name}、速度 {velocity_name} 和加速度 {acceleration_name}。\n"
+    obs += f"{position_name}: 最小值 {metrics[f'{exp_id}_{position_name}_min']:.6f}, 最大值 {metrics[f'{exp_id}_{position_name}_max']:.6f}, 均值 {metrics[f'{exp_id}_{position_name}_mean']:.6f}, 标准差 {metrics[f'{exp_id}_{position_name}_std']:.6f}\n"
+    obs += f"{velocity_name}: 最小值 {metrics[f'{exp_id}_{velocity_name}_v_min']:.6f}, 最大值 {metrics[f'{exp_id}_{velocity_name}_v_max']:.6f}, 均值 {metrics[f'{exp_id}_{velocity_name}_v_mean']:.6f}, 标准差 {metrics[f'{exp_id}_{velocity_name}_v_std']:.6f}\n"
+    obs += f"{acceleration_name}: 最小值 {metrics[f'{exp_id}_{acceleration_name}_a_min']:.6f}, 最大值 {metrics[f'{exp_id}_{acceleration_name}_a_max']:.6f}, 均值 {metrics[f'{exp_id}_{acceleration_name}_a_mean']:.6f}, 标准差 {metrics[f'{exp_id}_{acceleration_name}_a_std']:.6f}\n"
+    obs += "运动学曲线图已保存。"
 
     return {
-        "observation": observation,
+        "observation": obs,
         "derived_series": derived_series,
-        "figures": [],
+        "figures": [figure_path],
         "metrics": metrics
     }

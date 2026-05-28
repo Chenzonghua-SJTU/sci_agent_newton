@@ -34,9 +34,9 @@ class ScientificReporter:
             "## Research Process",
             f"- Number of experiments: `{len(notebook.experiments)}`",
             f"- Number of actions executed: `{len(notebook.action_history)}`",
-            f"- Number of invariant searches: `{len(notebook.invariant_history)}`",
-            f"- Number of cross-experiment checks: `{len(notebook.generalization_checks)}`",
-            f"- Number of candidate laws: `{len(notebook.candidate_laws)}`",
+            f"- Number of ledger observations: `{len(notebook.observations)}`",
+            f"- Number of hypothesis validations: `{len(notebook.validations)}`",
+            f"- Number of hypotheses: `{len(notebook.hypothesis_registry.all_records())}`",
             "",
             "## Experimental Setup",
         ]
@@ -48,16 +48,16 @@ class ScientificReporter:
                 lines.append("")
 
         for experiment_id, record in sorted(notebook.experiments.items()):
-            force_text = (
-                str(record.config.constant_force)
+            force_value = (
+                float(record.config.constant_force)
                 if record.config.force_field_type.value == "constant"
-                else "N/A (free scene; constant_force ignored)"
+                else 0.0
             )
             lines.extend(
                 [
                     f"### {experiment_id}",
                     f"- Force Field Type: `{record.config.force_field_type.value}`",
-                    f"- External Force `F_ext`: `{force_text}`",
+                    f"- External Force `F_ext`: `{force_value:.6g}`",
                     f"- Initial Position `q0`: `{record.config.initial_q}`",
                     f"- Initial Velocity `v0`: `{record.config.initial_v}`",
                     f"- Time Span: `{record.config.t_span}`",
@@ -89,65 +89,41 @@ class ScientificReporter:
             lines.append(f"- {note}")
         lines.append("")
 
-        lines.extend(["## Invariant Search Results"])
-        if notebook.invariant_history:
-            for idx, invariant in enumerate(notebook.invariant_history, start=1):
-                complexity_text = (
-                    "N/A" if invariant.complexity is None else f"{invariant.complexity:.6f}"
-                )
+        lines.extend(["## Experiment Data Ledger"])
+        if notebook.observations:
+            lines.append("### Observations")
+            for observation in notebook.observations:
                 lines.extend(
                     [
-                        f"### Invariant Search {idx}",
-                        f"- Candidate Equation: `{invariant.equation}`",
-                        f"- Loss: `{invariant.loss:.12f}`",
-                        f"- Complexity: `{complexity_text}`",
-                        f"- Residual Std: `{invariant.residual_std:.12f}`",
-                        f"- Predicted Mean: `{invariant.predicted_mean:.12f}`",
-                        f"- Score: `{invariant.score:.12f}`",
-                        "",
+                        f"- `{observation.observation_id}` step `{observation.step_index}`",
+                        f"  - Summary: {observation.summary}",
+                        f"  - Source Data Refs: `{observation.source_data_refs}`",
+                        f"  - Metrics: `{observation.metrics}`",
                     ]
                 )
         else:
-            lines.append("- No invariant search was executed.")
-            lines.append("")
+            lines.append("- No ledger observations were recorded.")
+        lines.append("")
 
-        lines.extend(["## Cross-Experiment Generalization Checks"])
-        if notebook.generalization_checks:
-            for idx, check in enumerate(notebook.generalization_checks, start=1):
+        if notebook.validations:
+            lines.append("### Validations")
+            for validation in notebook.validations:
+                verdict = "supports" if validation.supports else "refutes"
                 lines.extend(
                     [
-                        f"### Check {idx}",
-                        f"- Expression: `{check.expression}`",
-                        f"- Experiments: `{check.experiment_ids}`",
-                        f"- Metric: `{check.metric_name}`",
-                        f"- Aggregate Score: `{check.aggregate_score:.6f}`",
-                        f"- Details: `{check.metric_values}`",
-                        f"- Summary: {check.summary_text}",
-                        "",
+                        f"- `{validation.validation_id}` {verdict} `{validation.hypothesis_id}`",
+                        f"  - Experiments: `{validation.experiment_ids}`",
+                        f"  - Metric: `{validation.metric_name}`",
+                        f"  - Aggregate Score: `{validation.aggregate_score}`",
+                        f"  - Details: `{validation.metric_values}`",
+                        f"  - Summary: {validation.summary}",
                     ]
                 )
         else:
-            lines.append("- No cross-experiment validation was executed.")
-            lines.append("")
+            lines.append("- No hypothesis validations were recorded.")
+        lines.append("")
 
-        lines.extend(["## Candidate Law Ranking"])
-        if notebook.candidate_laws:
-            ranked = sorted(notebook.candidate_laws, key=lambda item: item.score)
-            for idx, candidate in enumerate(ranked, start=1):
-                lines.extend(
-                    [
-                        f"### Candidate {idx}",
-                        f"- Expression: `{candidate.expression}`",
-                        f"- Source Experiment: `{candidate.source_experiment_id}`",
-                        f"- Score: `{candidate.score:.12f}`",
-                        f"- Origin: `{candidate.origin}`",
-                        f"- Notes: {candidate.notes}",
-                        "",
-                    ]
-                )
-        else:
-            lines.append("- No candidate laws were ranked.")
-            lines.append("")
+        lines.extend(notebook.hypothesis_registry.to_markdown())
 
         lines.extend(
             [
@@ -202,23 +178,24 @@ class ScientificReporter:
             plt.close(fig)
             generated_paths.append(figure_path)
 
-        if notebook.generalization_checks:
-            for idx, check in enumerate(notebook.generalization_checks, start=1):
-                figure_path = output_dir / f"generalization_check_{idx:02d}.png"
-                fig, ax = plt.subplots(figsize=(8, 4.5))
-                experiment_ids = list(check.metric_values.keys())
-                metric_values = [check.metric_values[exp_id] for exp_id in experiment_ids]
+        for idx, validation in enumerate(notebook.validations, start=1):
+            if not validation.metric_values:
+                continue
+            figure_path = output_dir / f"validation_{idx:02d}.png"
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            labels = list(validation.metric_values.keys())
+            values = [validation.metric_values[label] for label in labels]
 
-                ax.bar(experiment_ids, metric_values)
-                ax.set_title(f"Generalization check {idx}: {check.expression}")
-                ax.set_xlabel("Experiment ID")
-                ax.set_ylabel(check.metric_name)
-                ax.grid(axis="y", alpha=0.3)
+            ax.bar(labels, values)
+            ax.set_title(f"{validation.validation_id}: {validation.hypothesis_id}")
+            ax.set_xlabel("Metric key")
+            ax.set_ylabel(validation.metric_name)
+            ax.grid(axis="y", alpha=0.3)
 
-                fig.tight_layout()
-                fig.savefig(figure_path, dpi=160, bbox_inches="tight")
-                plt.close(fig)
-                generated_paths.append(figure_path)
+            fig.tight_layout()
+            fig.savefig(figure_path, dpi=160, bbox_inches="tight")
+            plt.close(fig)
+            generated_paths.append(figure_path)
 
         return generated_paths
 

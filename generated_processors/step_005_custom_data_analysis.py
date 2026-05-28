@@ -1,170 +1,132 @@
 import os
-import math
 import numpy as np
-from scipy.signal import savgol_filter
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from scipy import stats
 
 def process(payload: dict) -> dict:
-    # 解析参数
+    action = payload.get("action")
     params = payload.get("parameters", {})
-    exp_ids = params.get("experiment_ids", [])
-    if not exp_ids:
-        exp_ids = list(payload.get("experiments", {}).keys())
-    
+    experiments = payload.get("experiments", {})
     output_dir = payload.get("output_dir", ".")
+
+    # 只处理 exp_03
+    exp_ids = params.get("experiment_ids", ["exp_03"])
+    # 但参数已明确只包含 exp_03，所以我们只取第一个，或者迭代处理其实只有一个
+    target_exp = "exp_03"
+    if target_exp not in experiments:
+        raise ValueError(f"Experiment {target_exp} not found in payload experiments.")
     
-    derived_series = []
-    figures = []
-    metrics = {}
-    observations = []
-    
-    for eid in exp_ids:
-        exp = payload["experiments"].get(eid)
-        if exp is None:
-            raise ValueError(f"Experiment {eid} not found in payload")
-        
-        config = exp.get("config", {})
-        series = exp.get("series", {})
-        
-        # 只处理指定的实验 ID 和名称匹配（exp_03）
-        if eid != "exp_03":
-            continue
-        
-        # 提取 t 和 q
-        t = np.array(series.get("t"))
-        q = np.array(series.get("q"))
-        if t is None or q is None:
-            raise ValueError(f"Experiment {eid} missing t or q series")
-        
-        # 检查长度一致性
-        n = len(t)
-        if len(q) != n:
-            raise ValueError(f"Experiment {eid} t and q length mismatch")
-        
-        # 采样间隔
-        dt = np.mean(np.diff(t)) if n > 1 else 1.0
-        
-        # 使用 Savitzky-Golay 滤波估计速度和加速度
-        window_length = 9
-        polyorder = 2
-        # 窗口长度不能超过数据长度
-        if n < window_length:
-            raise ValueError(f"Experiment {eid} has insufficient points ({n}) for window {window_length}")
-        
-        v_sg = savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=1, delta=dt)
-        a_sg = savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=2, delta=dt)
-        
-        # 计算加速度统计
-        a_mean = float(np.mean(a_sg))
-        a_std = float(np.std(a_sg))
-        v_mean = float(np.mean(v_sg))
-        v_std = float(np.std(v_sg))
-        
-        # 加速度是否近似常数：标准偏差相对于均值很小？这里只输出值，由 LLM 判断
-        # 记录到 metrics
-        
-        # 二次多项式拟合：q = a*t^2 + b*t + c
-        coeffs = np.polyfit(t, q, 2)  # [a, b, c] 从高次到低次
-        a_fit = coeffs[0]
-        b_fit = coeffs[1]
-        c_fit = coeffs[2]
-        
-        # 拟合值和残差
-        q_fit = np.polyval(coeffs, t)
-        residuals = q - q_fit
-        rmse = math.sqrt(np.mean(residuals**2))
-        
-        # 检查 b 和 c 是否接近 0，a 是否接近 0.5（数值误差）
-        # 记录值，由 LLM 判断
-        
-        # 外部力
-        F_ext = config.get("constant_force", config.get("F_ext", None))
-        if F_ext is None:
-            # 尝试从 config 中查找其他字段
-            F_ext = config.get("force", None)
-        if F_ext is None:
-            F_ext = 1.0  # 默认值，但一般会有
-        
-        # 加速度均值与 F_ext 比较
-        acc_compared_to_F = a_mean - float(F_ext)
-        
-        # 构建 observation 用字符串
-        obs_lines = []
-        obs_lines.append(f"实验 {eid} (力场类型={config.get('force_field_type','?')}, F_ext={F_ext}) 分析结果：")
-        obs_lines.append(f"  位置 q(t) 范围: [{float(np.min(q)):.6f}, {float(np.max(q)):.6f}]")
-        obs_lines.append(f"  速度 v_sg 均值={v_mean:.15f}, 标准差={v_std:.15e}")
-        obs_lines.append(f"  加速度 a_sg 均值={a_mean:.15f}, 标准差={a_std:.15e}")
-        obs_lines.append(f"  加速度标准差较小: {'是' if a_std < 1e-10 else '否'}")
-        obs_lines.append(f"  二次多项式拟合 q = a*t^2 + b*t + c:")
-        obs_lines.append(f"    a={a_fit:.15f}, b={b_fit:.15f}, c={c_fit:.15f}")
-        obs_lines.append(f"    残差 RMSE = {rmse:.15e}")
-        obs_lines.append(f"  加速度均值与外力 F_ext 的差异 Δa = a_mean - F_ext = {acc_compared_to_F:.15f}")
-        obs_lines.append(f"  若加速度接近常数，则 Δa 反映质量倒数（若 F=ma）")
-        observations.append("\n".join(obs_lines))
-        
-        # 记录 metrics
-        metrics[f"{eid}_t_len"] = n
-        metrics[f"{eid}_v_mean"] = v_mean
-        metrics[f"{eid}_v_std"] = v_std
-        metrics[f"{eid}_a_mean"] = a_mean
-        metrics[f"{eid}_a_std"] = a_std
-        metrics[f"{eid}_a_approx_constant"] = 1 if a_std < 1e-10 else 0
-        metrics[f"{eid}_quadratic_a"] = float(a_fit)
-        metrics[f"{eid}_quadratic_b"] = float(b_fit)
-        metrics[f"{eid}_quadratic_c"] = float(c_fit)
-        metrics[f"{eid}_quadratic_rmse"] = rmse
-        metrics[f"{eid}_F_ext"] = float(F_ext)
-        metrics[f"{eid}_delta_a_F"] = acc_compared_to_F
-        
-        # 创建加速度派生序列
-        derived_series.append({
-            "experiment_id": eid,
-            "name": "acceleration",
-            "values": a_sg.tolist(),
-            "source_name": "Savitzky-Golay二阶导数 (窗口9, 阶2)",
-            "provenance": "generated data processor: custom_data_analysis for exp_03",
-            "description": "从 q 通过 Savitzky-Golay 滤波估计的加速度序列"
-        })
-        
-        # 绘制图
-        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-        axes[0].plot(t, q, 'b-', label='q(t)')
-        axes[0].plot(t, q_fit, 'r--', label=f'二次拟合: a={a_fit:.4f}, b={b_fit:.4f}, c={c_fit:.4f}')
-        axes[0].set_ylabel('q')
-        axes[0].legend()
-        axes[0].grid(True)
-        
-        axes[1].plot(t, v_sg, 'g-', label='v_sg')
-        axes[1].set_ylabel('v')
-        axes[1].legend()
-        axes[1].grid(True)
-        
-        axes[2].plot(t, a_sg, 'm-', label='a_sg')
-        axes[2].axhline(y=a_mean, color='k', linestyle='--', alpha=0.5, label=f'a_mean={a_mean:.4f}')
-        axes[2].set_xlabel('t')
-        axes[2].set_ylabel('a')
-        axes[2].legend()
-        axes[2].grid(True)
-        
-        fig.suptitle(f'Kinematics Analysis for {eid} (F_ext={F_ext})')
-        fig.tight_layout()
-        
-        fig_path = os.path.join(output_dir, f"{eid}_kinematics_quadratic.png")
-        fig.savefig(fig_path, dpi=100)
-        plt.close(fig)
-        figures.append(fig_path)
-        
-        # 图也保存为另一张备用（可选）
-    
-    # 将多个实验的观察合并
-    if not observations:
-        observations.append("没有匹配的实验进行处理。")
-    
-    # 如果只处理了一个实验，observation 可以精简一些
-    observation_str = "\n".join(observations)
-    
+    exp = experiments[target_exp]
+    config = exp.get("config", {})
+    series = exp.get("series", {})
+    available = exp.get("available_series", [])
+
+    # 检查必须的序列
+    required_series = ["a_exp_03", "v_exp_03", "t"]
+    for s in required_series:
+        if s not in series:
+            raise ValueError(f"Required series '{s}' not available in experiment {target_exp}. Available: {available}")
+
+    t = np.array(series["t"], dtype=float)
+    a = np.array(series["a_exp_03"], dtype=float)
+    v = np.array(series["v_exp_03"], dtype=float)
+
+    # ----------------- 1. a vs v 散点图 + 线性拟合 -----------------
+    slope, intercept, r_value, p_value, std_err = stats.linregress(v, a)
+    r_squared = r_value ** 2
+    a_pred = intercept + slope * v
+    residuals = a - a_pred
+
+    # 图1: 散点+拟合线
+    fig1, ax1 = plt.subplots(figsize=(6,5))
+    ax1.scatter(v, a, label='Data', alpha=0.7)
+    v_sort = np.sort(v)
+    ax1.plot(v_sort, intercept + slope * v_sort, 'r-', label=f'Linear fit: a = {intercept:.4f} + {slope:.4f}*v')
+    ax1.set_xlabel('v_exp_03')
+    ax1.set_ylabel('a_exp_03')
+    ax1.set_title('a vs v with linear fit (exp_03)')
+    ax1.legend()
+    ax1.grid(True, linestyle='--', alpha=0.5)
+    fig1_path = os.path.join(output_dir, "a_vs_v_linear_fit_exp_03.png")
+    fig1.savefig(fig1_path, dpi=150, bbox_inches='tight')
+    plt.close(fig1)
+
+    # ----------------- 2. a + k*v 常数性检验 (k=0.2) -----------------
+    k = 0.2
+    q = a + k * v  # 表达式 a + k*v
+    q_mean = np.mean(q)
+    q_std = np.std(q, ddof=1)
+    # 对时间做线性回归看趋势
+    slope_q, intercept_q, r_q, p_q, std_err_q = stats.linregress(t, q)
+    r_squared_q = r_q ** 2  # 拟合适度
+    # 检查斜率是否接近零（趋势小）
+    trend_significant = abs(slope_q) > 0.01 * (q_std if q_std > 0 else 1e-9)
+
+    # 图2: a + k*v 随时间变化
+    fig2, ax2 = plt.subplots(figsize=(6,4))
+    ax2.plot(t, q, 'b.-', label=f'a + {k}*v')
+    ax2.axhline(y=q_mean, color='gray', linestyle='--', label=f'mean={q_mean:.4f}')
+    ax2.set_xlabel('t')
+    ax2.set_ylabel('a + k*v')
+    ax2.set_title(f'a + {k}*v vs time (exp_03)')
+    ax2.legend()
+    ax2.grid(True, linestyle='--', alpha=0.5)
+    fig2_path = os.path.join(output_dir, "a_plus_kv_vs_time_exp_03.png")
+    fig2.savefig(fig2_path, dpi=150, bbox_inches='tight')
+    plt.close(fig2)
+
+    # ----------------- 构造返回 -----------------
+    observation = (
+        f"实验 {target_exp} 分析完成。\n"
+        f"线性拟合: a = {intercept:.4f} + {slope:.4f} * v, R² = {r_squared:.4f}, 斜率 p-value = {p_value:.2e}\n"
+        f"残差统计: 均值={np.mean(residuals):.4f}, 标准差={np.std(residuals, ddof=1):.4f}\n"
+        f"常数性检验 (k={k}): a + {k}*v 均值={q_mean:.4f}, 标准差={q_std:.4f}\n"
+        f"  a+{k}*v 对时间的线性趋势: 斜率={slope_q:.6f}, R²={r_squared_q:.4f}, p={p_q:.2e}\n"
+        f"  趋势明显性判断: {'可能存在趋势' if trend_significant else '无明显趋势（近似常数）'}\n"
+        f"图像已保存: {os.path.basename(fig1_path)}, {os.path.basename(fig2_path)}。\n"
+        f"残差序列 'residual_linear_a_vs_v' 和派生序列 'a_plus_{k}_v' 已返回。"
+    )
+
+    derived_series = [
+        {
+            "experiment_id": target_exp,
+            "name": "residual_linear_a_vs_v",
+            "values": residuals.tolist(),
+            "source_name": f"residual = a_exp_03 - ({intercept:.4f} + {slope:.4f} * v_exp_03)",
+            "provenance": "generated data processor: custom_data_analysis",
+            "description": "线性拟合残差 a_exp_03 - (intercept + slope*v_exp_03)"
+        },
+        {
+            "experiment_id": target_exp,
+            "name": f"a_plus_{k}_v",
+            "values": q.tolist(),
+            "source_name": f"a_exp_03 + {k} * v_exp_03",
+            "provenance": "generated data processor: custom_data_analysis",
+            "description": f"常数性检验所用序列 a + {k}*v"
+        }
+    ]
+
+    metrics = {
+        "linear_slope": slope,
+        "linear_intercept": intercept,
+        "linear_R2": r_squared,
+        "linear_pvalue": p_value,
+        "linear_residual_mean": float(np.mean(residuals)),
+        "linear_residual_std": float(np.std(residuals, ddof=1)),
+        "a_plus_kv_mean": q_mean,
+        "a_plus_kv_std": q_std,
+        "a_plus_kv_trend_slope": slope_q,
+        "a_plus_kv_trend_R2": r_squared_q,
+        "a_plus_kv_trend_pvalue": p_q,
+        "k_used": k
+    }
+
+    figures = [fig1_path, fig2_path]
+
     return {
-        "observation": observation_str,
+        "observation": observation,
         "derived_series": derived_series,
         "figures": figures,
         "metrics": metrics

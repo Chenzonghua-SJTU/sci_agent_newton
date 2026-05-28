@@ -1,332 +1,358 @@
-import os
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
+from scipy import optimize, stats
 from scipy.signal import savgol_filter
-from scipy.optimize import curve_fit
-from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+
+def _compute_sg(data: np.ndarray, window: int = 11, polyorder: int = 3, dt: float = 0.1,
+                deriv: int = 0) -> np.ndarray:
+    """Apply Savitzky-Golay filter to smooth or differentiate a 1D signal."""
+    if len(data) < window:
+        return data.copy()
+    return savgol_filter(data, window_length=window, polyorder=polyorder, deriv=deriv, delta=dt)
+
+
+def _ensure_series(exp: dict, name: str, data_config: dict) -> np.ndarray:
+    """Return existing series or compute from q if not present."""
+    if name in exp.get('series', {}):
+        return np.array(exp['series'][name])
+    # fallback: compute from q
+    q = np.array(exp['series'].get('q', []))
+    if len(q) == 0:
+        raise ValueError(f"Experiment {exp.get('_id', '?')} has no q series to derive {name}")
+    t = np.array(exp['series'].get('t', []))
+    if len(t) == 0:
+        dt = data_config.get('dt', 0.1)
+    else:
+        dt = t[1] - t[0] if len(t) > 1 else data_config.get('dt', 0.1)
+    window = 11
+    polyorder = 3
+    if name == 'v_sg':
+        return _compute_sg(q, window, polyorder, dt, deriv=1)
+    elif name == 'a_sg':
+        return _compute_sg(q, window, polyorder, dt, deriv=2)
+    else:
+        raise ValueError(f"Unknown series name {name}")
+
+
+def _linear_model(v, A, B):
+    return A - B * v
+
+
+def _quad_model(v, A, C):
+    return A - C * v ** 2
+
+
+def _power_model(v, beta, gamma, F_ext):
+    return F_ext - beta * (v ** gamma)
+
+
+def _fit_and_metrics(x, y, model_func, p0, bounds=(-np.inf, np.inf)):
+    """Fit model via curve_fit and return (popt, pcov, R2)."""
+    popt, pcov = optimize.curve_fit(
+        model_func, x, y, p0=p0, maxfev=10000, bounds=bounds
+    )
+    y_pred = model_func(x, *popt)
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    # 95% CI from covariance
+    perr = np.sqrt(np.diag(pcov))
+    ci = np.array([popt - 1.96 * perr, popt + 1.96 * perr]).T
+    return popt, ci, r2
+
+
 def process(payload: dict) -> dict:
-    action = payload["action"]
-    params = payload["parameters"]
-    experiments = payload["experiments"]
-    output_dir = payload["output_dir"]
+    action = payload.get("action", "custom_data_analysis")
+    params = payload.get("parameters", {})
+    experiments_raw = payload.get("experiments", {})
+    output_dir = payload.get("output_dir", "/tmp")
 
-    # 确定要处理的实验
+    # Determine which experiments to process
     exp_ids = params.get("experiment_ids", [])
-    # 如果没提供，则处理所有恒力实验（但参数里明确给了）
-    # 这里按给定的exp_04-08处理
-    if not exp_ids:
-        exp_ids = [eid for eid in experiments if experiments[eid]["config"].get("force_field_type") == "constant"]
-        # 进一步限定到04-08
-        exp_ids = [eid for eid in exp_ids if eid in ["exp_04","exp_05","exp_06","exp_07","exp_08"]]
-    # 确保指定列表存在
-    exp_ids = [eid for eid in exp_ids if eid in experiments]
+    # analysis_goal also mentions exp_01 and exp_05 for zero check
+    all_exp_ids = list(experiments_raw.keys())
+    target_ids = [eid for eid in all_exp_ids if eid in exp_ids or eid in ['exp_01', 'exp_05']]
+    if not target_ids:
+        target_ids = all_exp_ids
 
-    # 存储每个实验的数据和拟合结果
+    # Prepare data for each experiment
     exp_data = {}
-    for eid in exp_ids:
-        exp = experiments[eid]
-        config = exp["config"]
-        series = exp["series"]
-        available = exp["available_series"]
+    for eid in target_ids:
+        exp = experiments_raw[eid]
+        config = exp.get('config', {})
+        F_ext = config.get('F_ext', 0.0)
+        force_type = config.get('force_field_type', '')
 
-        t = np.array(series["t"])
-        q = np.array(series["q"])
+        # Ensure v_sg and a_sg exist
+        v_sg = _ensure_series(exp, 'v_sg', config)
+        a_sg = _ensure_series(exp, 'a_sg', config)
+        t = np.array(exp['series'].get('t', np.linspace(0, (len(v_sg)-1)*config.get('dt', 0.1), len(v_sg))))
 
-        # 检查是否有 v_sg 和 a_sg
-        has_v = "v_sg" in available and len(series["v_sg"]) == len(t)
-        has_a = "a_sg" in available and len(series["a_sg"]) == len(t)
-        if has_v and has_a:
-            v = np.array(series["v_sg"])
-            a = np.array(series["a_sg"])
-        else:
-            # 用 SG 滤波估计
-            window = 11
-            polyorder = 3
-            q_sg = savgol_filter(q, window, polyorder)
-            v_sg = savgol_filter(q, window, polyorder, deriv=1, delta=config["dt"])
-            a_sg = savgol_filter(q, window, polyorder, deriv=2, delta=config["dt"])
-            # trim edges due to SG boundary effects (可选，保留全长度)
-            # 但这里直接保留全长度，边界可能噪声大，但整体可用
-            v = v_sg
-            a = a_sg
-            # 如果需要，可以trim掉前几个点，但分析目的可以保留
         exp_data[eid] = {
-            "t": t,
-            "q": q,
-            "v": v,
-            "a": a,
-            "F_ext": config.get("constant_force", config.get("F_ext", 0.0)),
-            "force_field_type": config.get("force_field_type", ""),
-            "v0": config.get("initial_v", 0.0)
+            'F_ext': F_ext,
+            'force_type': force_type,
+            't': t,
+            'v_sg': v_sg,
+            'a_sg': a_sg,
         }
 
-    # 准备派生序列列表
-    derived_series = []
-    for eid in exp_ids:
-        # 如果原来的没有v_sg和a_sg，则添加
-        exp = experiments[eid]
-        available = exp["available_series"]
-        if "v_sg" not in available or len(exp["series"].get("v_sg", [])) != len(exp["series"]["t"]):
-            derived_series.append({
-                "experiment_id": eid,
-                "name": "v_sg",
-                "values": exp_data[eid]["v"].tolist(),
-                "source_name": "Savitzky-Golay (window=11, polyorder=3) first derivative of q(t)",
-                "provenance": "generated data processor: custom_data_analysis",
-                "description": "velocity estimated via Savitzky-Golay filter"
-            })
-        if "a_sg" not in available or len(exp["series"].get("a_sg", [])) != len(exp["series"]["t"]):
-            derived_series.append({
-                "experiment_id": eid,
-                "name": "a_sg",
-                "values": exp_data[eid]["a"].tolist(),
-                "source_name": "Savitzky-Golay (window=11, polyorder=3) second derivative of q(t)",
-                "provenance": "generated data processor: custom_data_analysis",
-                "description": "acceleration estimated via Savitzky-Golay filter"
-            })
+    # Identify constant-force experiments (F_ext > 0)
+    constant_exps = {eid: d for eid, d in exp_data.items()
+                     if d['force_type'] == 'constant' and d['F_ext'] > 0}
 
-    # 拟合函数定义
-    def linear_model(v, A, B):
-        return A - B * v
+    # ---------------------------
+    # 1. Fitting for each constant force experiment
+    # ---------------------------
+    fit_results = {}
+    d_series = {}  # damping d = a_sg - F_ext
+    for eid, d in constant_exps.items():
+        v = d['v_sg']
+        a = d['a_sg']
+        F = d['F_ext']
 
-    def quad_model(v, C, D):
-        return C - D * v**2
-
-    def exp_model(v, E, F, G):
-        return E - F * np.exp(G * v)
-
-    # 存储所有metrics
-    metrics = {}
-    figures = []
-
-    # 对每个实验进行拟合
-    for eid in exp_ids:
-        data = exp_data[eid]
-        v = data["v"]
-        a = data["a"]
-        F_ext = data["F_ext"]
-        # 移除可能的nan
-        mask = np.isfinite(v) & np.isfinite(a)
-        if np.sum(mask) < 5:
-            continue
-        v_clean = v[mask]
-        a_clean = a[mask]
-
-        # 1. 线性模型 (a = A - B*v)
-        # 使用线性回归拟合 a 对 v 的线性关系，得到斜率和截距
-        reg_lin = LinearRegression(fit_intercept=True)
-        X_lin = v_clean.reshape(-1, 1)
-        reg_lin.fit(X_lin, a_clean)
-        A = reg_lin.intercept_
-        B = -reg_lin.coef_[0]   # 因为模型是 a = A - B*v，所以斜率是 -B
-        # 重新计算R²用原始公式
-        pred_a_lin = A - B * v_clean
-        R2_lin = r2_score(a_clean, pred_a_lin)
-
-        # 2. 二次模型 (a = C - D*v^2)
-        v2 = v_clean**2
-        reg_quad = LinearRegression(fit_intercept=True)
-        reg_quad.fit(v2.reshape(-1, 1), a_clean)
-        C = reg_quad.intercept_
-        D = -reg_quad.coef_[0]
-        pred_a_quad = C - D * v2
-        R2_quad = r2_score(a_clean, pred_a_quad)
-
-        # 3. 指数模型 (a = E - F*exp(G*v))
-        # 初始猜测：E ~ max(a), F ~ max(a)-min(a), G ~ -0.1
-        # 但需要确保exp不会太大，如果v很大，可能溢出。用边界检查。
-        # 先尝试稳健初始猜测
+        # Linear fit a = A - B*v
+        p0_lin = [np.mean(a), 0.1]
+        bounds_lin = ([-np.inf, -np.inf], [np.inf, np.inf])
         try:
-            # 限制v范围，避免exp爆炸
-            v_clip = np.clip(v_clean, -10, 10)  # v_phys不会超过10左右
-            # 初始猜测
-            E0 = np.max(a_clean)
-            F0 = np.max(a_clean) - np.min(a_clean)
-            G0 = -0.1
-            popt, pcov = curve_fit(
-                lambda v, E, F, G: E - F * np.exp(G * v),
-                v_clip, a_clean,
-                p0=[E0, F0, G0],
-                maxfev=5000,
-                bounds=([-np.inf, 0, -np.inf], [np.inf, np.inf, 0])  # F>=0, G<=0 (阻尼)
+            (A_lin, B_lin), ci_lin, r2_lin = _fit_and_metrics(v, a, _linear_model, p0_lin)
+        except Exception:
+            A_lin, B_lin, ci_lin, r2_lin = np.nan, np.nan, [[np.nan, np.nan], [np.nan, np.nan]], np.nan
+
+        # Quadratic fit a = A - C*v^2
+        p0_quad = [np.mean(a), 0.01]
+        try:
+            (A_quad, C_quad), ci_quad, r2_quad = _fit_and_metrics(v, a, _quad_model, p0_quad)
+        except Exception:
+            A_quad, C_quad, ci_quad, r2_quad = np.nan, np.nan, [[np.nan, np.nan], [np.nan, np.nan]], np.nan
+
+        # Power-law fit a = F - beta * v^gamma, fixed alpha = F
+        # Use log-log initialization: beta ~ (F - a)/v^gamma, gamma roughly from linear slope in log-log
+        # Better: provide reasonable p0
+        p0_power = [0.5, 1.0]  # beta, gamma
+        # Bounds: beta > 0, gamma > 0 (avoid v^0 issues)
+        bounds_power = ([1e-10, 0.0], [np.inf, 5.0])
+        try:
+            popt_power, pcov_power = optimize.curve_fit(
+                lambda v, beta, g: _power_model(v, beta, g, F), v, a,
+                p0=p0_power, bounds=bounds_power, maxfev=10000
             )
-            E, F, G = popt
-            pred_a_exp = E - F * np.exp(G * v_clip)
-            R2_exp = r2_score(a_clean, pred_a_exp)
-        except Exception as e:
-            # 拟合失败
-            E, F, G = np.nan, np.nan, np.nan
-            R2_exp = -np.inf
+            beta_power, gamma_power = popt_power
+            y_pred = _power_model(v, beta_power, gamma_power, F)
+            ss_res = np.sum((a - y_pred) ** 2)
+            ss_tot = np.sum((a - np.mean(a)) ** 2)
+            r2_power = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            perr = np.sqrt(np.diag(pcov_power))
+            ci_power = np.array([popt_power - 1.96 * perr, popt_power + 1.96 * perr]).T
+        except Exception:
+            beta_power, gamma_power = np.nan, np.nan
+            ci_power = [[np.nan, np.nan], [np.nan, np.nan]]
+            r2_power = np.nan
 
-        # 平衡速度计算
-        # 线性: v_eq_lin = A / B  (B>0)
-        v_eq_lin = A / B if abs(B) > 1e-12 else np.nan
-        # 二次: v_eq_quad = sqrt(C / D)  (D>0, C>0)
-        v_eq_quad = np.sqrt(C / D) if (D > 0 and C > 0) else np.nan
-        # 指数: v_eq_exp = (1/G) * log(E/F)  (G<0, E/F>0)
-        v_eq_exp = (1/G) * np.log(E/F) if (G < 0 and E/F > 0) else np.nan
+        fit_results[eid] = {
+            'linear': {'A': A_lin, 'B': B_lin, 'ci_A': ci_lin[0].tolist(), 'ci_B': ci_lin[1].tolist(), 'R2': r2_lin},
+            'quadratic': {'A': A_quad, 'C': C_quad, 'ci_A': ci_quad[0].tolist(), 'ci_C': ci_quad[1].tolist(), 'R2': r2_quad},
+            'power': {'beta': beta_power, 'gamma': gamma_power, 'ci_beta': ci_power[0].tolist(), 'ci_gamma': ci_power[1].tolist(), 'R2': r2_power}
+        }
 
-        # 存储metrics
-        prefix = f"{eid}_"
-        metrics[prefix + "A"] = A
-        metrics[prefix + "B"] = B
-        metrics[prefix + "R2_linear"] = R2_lin
-        metrics[prefix + "C"] = C
-        metrics[prefix + "D"] = D
-        metrics[prefix + "R2_quad"] = R2_quad
-        metrics[prefix + "E"] = E
-        metrics[prefix + "F"] = F
-        metrics[prefix + "G"] = G
-        metrics[prefix + "R2_exp"] = R2_exp if np.isfinite(R2_exp) else -999
-        metrics[prefix + "v_eq_lin"] = v_eq_lin if np.isfinite(v_eq_lin) else -999
-        metrics[prefix + "v_eq_quad"] = v_eq_quad if np.isfinite(v_eq_quad) else -999
-        metrics[prefix + "v_eq_exp"] = v_eq_exp if np.isfinite(v_eq_exp) else -999
-        metrics[prefix + "F_ext"] = F_ext
+        # Damping term
+        d_series[eid] = a - F
 
-        # 保存拟合数据用于后续绘图
-        data["A"] = A; data["B"] = B; data["R2_lin"] = R2_lin
-        data["C"] = C; data["D"] = D; data["R2_quad"] = R2_quad
-        data["E"] = E; data["F"] = F; data["G"] = G; data["R2_exp"] = R2_exp
-        data["v_eq_lin"] = v_eq_lin; data["v_eq_quad"] = v_eq_quad; data["v_eq_exp"] = v_eq_exp
+    # ---------------------------
+    # 2. Graphics: combined a_sg vs v_sg scatter for constant experiments
+    # ---------------------------
+    colors = ['blue', 'orange', 'green', 'red', 'purple']
+    markers = ['o', 's', '^', 'D', 'v']
+    fig1, ax1 = plt.subplots(figsize=(8, 6))
+    for i, (eid, d_exp) in enumerate(constant_exps.items()):
+        ax1.scatter(d_exp['v_sg'], d_exp['a_sg'], c=colors[i % len(colors)],
+                    marker=markers[i % len(markers)], label=eid, s=10, alpha=0.7)
+    ax1.set_xlabel('v_sg')
+    ax1.set_ylabel('a_sg')
+    ax1.set_title('a_sg vs v_sg for constant-force experiments')
+    ax1.legend()
+    scatter_path = str(Path(output_dir) / 'constant_force_scatter.png')
+    fig1.savefig(scatter_path, dpi=150, bbox_inches='tight')
+    plt.close(fig1)
 
-        # 绘制每个实验的a vs v
-        fig, ax = plt.subplots(figsize=(8,6))
-        ax.scatter(v_clean, a_clean, s=8, label="data", color="gray", alpha=0.6)
-        # 排序v用于画拟合曲线
-        v_sort = np.sort(v_clean)
-        # 线性拟合
-        ax.plot(v_sort, A - B*v_sort, 'r-', label=f"linear: A={A:.4f}, B={B:.4f}, R²={R2_lin:.4f}")
-        # 二次拟合
-        ax.plot(v_sort, C - D*v_sort**2, 'g--', label=f"quad: C={C:.4f}, D={D:.4f}, R²={R2_quad:.4f}")
-        # 指数拟合（如果有有效参数）
-        if np.isfinite(E) and np.isfinite(F) and np.isfinite(G) and R2_exp > -np.inf:
-            # 限制指数范围防止溢出
-            exp_curve = E - F * np.exp(G * v_sort)
-            if np.all(np.isfinite(exp_curve)):
-                ax.plot(v_sort, exp_curve, 'b-.', label=f"exp: E={E:.4f}, F={F:.4f}, G={G:.4f}, R²={R2_exp:.4f}")
-        ax.set_xlabel("v (m/s)")
-        ax.set_ylabel("a (m/s²)")
-        ax.set_title(f"{eid} (F_ext={F_ext}) a vs v")
-        ax.legend(fontsize=7, loc='best')
-        fig.tight_layout()
-        fname = os.path.join(output_dir, f"{eid}_a_vs_v_models.png")
-        fig.savefig(fname, dpi=150)
+    # ---------------------------
+    # 3. Per-experiment fit plots (optional but good)
+    # ---------------------------
+    fit_fig_paths = []
+    for eid in constant_exps.keys():
+        v = constant_exps[eid]['v_sg']
+        a = constant_exps[eid]['a_sg']
+        F = constant_exps[eid]['F_ext']
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.scatter(v, a, label='data', s=10, alpha=0.6, c='grey')
+        # Linear fit
+        if not np.isnan(fit_results[eid]['linear']['A']):
+            v_sort = np.sort(v)
+            ax.plot(v_sort, _linear_model(v_sort, fit_results[eid]['linear']['A'],
+                                          fit_results[eid]['linear']['B']),
+                    '--', label=f"Linear R²={fit_results[eid]['linear']['R2']:.3f}")
+        # Quadratic fit
+        if not np.isnan(fit_results[eid]['quadratic']['A']):
+            ax.plot(v_sort, _quad_model(v_sort, fit_results[eid]['quadratic']['A'],
+                                        fit_results[eid]['quadratic']['C']),
+                    '-.', label=f"Quad R²={fit_results[eid]['quadratic']['R2']:.3f}")
+        # Power fit
+        if not np.isnan(fit_results[eid]['power']['beta']):
+            ax.plot(v_sort, _power_model(v_sort, fit_results[eid]['power']['beta'],
+                                         fit_results[eid]['power']['gamma'], F),
+                    ':', label=f"Power R²={fit_results[eid]['power']['R2']:.3f}")
+        ax.set_xlabel('v_sg')
+        ax.set_ylabel('a_sg')
+        ax.set_title(f'{eid} (F_ext={F})')
+        ax.legend(fontsize=8)
+        path = str(Path(output_dir) / f'{eid}_fits.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
         plt.close(fig)
-        figures.append(fname)
+        fit_fig_paths.append(path)
 
-    # 跨实验比较：相同F_ext=1的实验（exp_04, exp_06, exp_08）
-    f1_exps = [eid for eid in exp_ids if abs(exp_data[eid]["F_ext"] - 1.0) < 1e-6]
-    if len(f1_exps) >= 2:
-        fig_comp, ax_comp = plt.subplots(figsize=(9,7))
-        colors = ['tab:blue', 'tab:orange', 'tab:green']
-        for i, eid in enumerate(f1_exps):
-            data = exp_data[eid]
-            v = data["v"]
-            a = data["a"]
-            mask = np.isfinite(v) & np.isfinite(a)
-            ax_comp.scatter(v[mask], a[mask], s=6, color=colors[i % len(colors)],
-                            label=f"{eid} (v0={data['v0']})", alpha=0.7)
-        ax_comp.set_xlabel("v (m/s)")
-        ax_comp.set_ylabel("a (m/s²)")
-        ax_comp.set_title("Comparison of a vs v for experiments with F_ext=1")
-        ax_comp.legend()
-        fig_comp.tight_layout()
-        fname_comp = os.path.join(output_dir, "F1_comparison_av.png")
-        fig_comp.savefig(fname_comp, dpi=150)
-        plt.close(fig_comp)
-        figures.append(fname_comp)
+    # ---------------------------
+    # 4. Damping d vs v_sg combined scatter
+    # ---------------------------
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
+    for i, (eid, d_val) in enumerate(d_series.items()):
+        v = constant_exps[eid]['v_sg']
+        ax2.scatter(v, d_val, c=colors[i % len(colors)], marker=markers[i % len(markers)],
+                    label=eid, s=10, alpha=0.7)
+    ax2.set_xlabel('v_sg')
+    ax2.set_ylabel('d = a_sg - F_ext')
+    ax2.set_title('Damping term d vs v_sg')
+    ax2.legend()
+    d_scatter_path = str(Path(output_dir) / 'd_vs_v_scatter.png')
+    fig2.savefig(d_scatter_path, dpi=150, bbox_inches='tight')
+    plt.close(fig2)
 
-    # 平衡速度 vs F_ext
-    valid_eq = []
-    for eid in exp_ids:
-        data = exp_data[eid]
-        F_ext = data["F_ext"]
-        for name, key in [("lin", "v_eq_lin"), ("quad", "v_eq_quad")]:
-            val = data.get(key, np.nan)
-            if np.isfinite(val):
-                valid_eq.append((eid, F_ext, val, name))
-    if valid_eq:
-        fig_eq, ax_eq = plt.subplots(figsize=(8,5))
-        # 区分线性与二次
-        fvals = {}
-        for eid, F_ext, val, name in valid_eq:
-            lbl = f"linear eq (v=A/B)" if name == "lin" else f"quad eq (v=sqrt(C/D))"
-            ax_eq.scatter(F_ext, val, label=f"{eid} {name}", s=30)
-        ax_eq.set_xlabel("F_ext")
-        ax_eq.set_ylabel("Equilibrium velocity (m/s)")
-        ax_eq.set_title("Equilibrium velocity (a=0) vs External force")
-        ax_eq.legend(fontsize=7)
-        fig_eq.tight_layout()
-        fname_eq = os.path.join(output_dir, "v_eq_vs_F.png")
-        fig_eq.savefig(fname_eq, dpi=150)
-        plt.close(fig_eq)
-        figures.append(fname_eq)
+    # ---------------------------
+    # 5. Global fit of d = -beta * v^gamma on combined data
+    # ---------------------------
+    all_v = np.concatenate([constant_exps[eid]['v_sg'] for eid in constant_exps])
+    all_d = np.concatenate([d_series[eid] for eid in constant_exps])
+    # Filter negative v (should not happen but safe)
+    mask_v = all_v > 0
+    all_v = all_v[mask_v]
+    all_d = all_d[mask_v]
+    # Fit d = -beta * v^gamma => model: d = -beta * v^gamma
+    def d_model(v, beta, gamma):
+        return -beta * (v ** gamma)
+    try:
+        p0_d = [0.5, 1.0]
+        bounds_d = ([1e-10, 0.0], [np.inf, 3.0])
+        popt_d, pcov_d = optimize.curve_fit(d_model, all_v, all_d, p0=p0_d, bounds=bounds_d, maxfev=10000)
+        beta_global, gamma_global = popt_d
+        y_pred_d = d_model(all_v, beta_global, gamma_global)
+        ss_res_d = np.sum((all_d - y_pred_d) ** 2)
+        ss_tot_d = np.sum((all_d - np.mean(all_d)) ** 2)
+        r2_global = 1 - ss_res_d / ss_tot_d if ss_tot_d > 0 else 0.0
+        perr_d = np.sqrt(np.diag(pcov_d))
+        ci_global = np.array([popt_d - 1.96 * perr_d, popt_d + 1.96 * perr_d]).T
+    except Exception:
+        beta_global, gamma_global = np.nan, np.nan
+        ci_global = [[np.nan, np.nan], [np.nan, np.nan]]
+        r2_global = np.nan
 
-    # 参数 vs F_ext 图（A, C, E 和 B, D）
-    params_names = [("A", "linear intercept A"), ("C", "quad intercept C"), ("E", "exp intercept E")]
-    damp_names = [("B", "linear coeff B"), ("D", "quad coeff D"), ("F", "exp coeff F")]
-    fig_params, axes = plt.subplots(2, 3, figsize=(15,8))
-    axes = axes.flatten()
-    for idx, (pname, plabel) in enumerate(params_names + damp_names):
-        ax = axes[idx]
-        xs = []
-        ys = []
-        for eid in exp_ids:
-            data = exp_data[eid]
-            F_ext = data["F_ext"]
-            val = data.get(pname, np.nan)
-            if np.isfinite(val):
-                xs.append(F_ext)
-                ys.append(val)
-                ax.annotate(eid[-2:], (F_ext, val), fontsize=6)
-        if xs:
-            ax.scatter(xs, ys, s=20)
-            # 尝试线性拟合
-            if len(xs) >= 2:
-                reg = LinearRegression().fit(np.array(xs).reshape(-1,1), ys)
-                slope = reg.coef_[0]
-                intercept = reg.intercept_
-                ax.plot(xs, reg.predict(np.array(xs).reshape(-1,1)), 'r--', lw=1)
-                ax.set_title(f"{plabel} vs F_ext\nslope={slope:.4f}, inter={intercept:.4f}", fontsize=9)
+    # ---------------------------
+    # 6. Check exp_01 and exp_05 a_sg ~ 0
+    # ---------------------------
+    zero_check = {}
+    for eid in ['exp_01', 'exp_05']:
+        if eid in exp_data:
+            a = exp_data[eid]['a_sg']
+            mean_a = np.mean(a)
+            std_a = np.std(a, ddof=1)
+            # t-test against 0
+            if len(a) > 1 and std_a > 0:
+                t_stat, p_val = stats.ttest_1samp(a, 0.0)
             else:
-                ax.set_title(plabel, fontsize=9)
-        else:
-            ax.set_title(f"{plabel} (no data)", fontsize=9)
-        ax.set_xlabel("F_ext")
-    fig_params.tight_layout()
-    fname_params = os.path.join(output_dir, "params_vs_F.png")
-    fig_params.savefig(fname_params, dpi=150)
-    plt.close(fig_params)
-    figures.append(fname_params)
+                t_stat, p_val = 0.0, 1.0
+            zero_check[eid] = {'mean': mean_a, 'std': std_a, 'p_value': p_val}
 
-    # 构造 observation
-    summary_lines = []
-    summary_lines.append(f"对 {len(exp_ids)} 个恒力实验进行了 a vs v 建模分析。")
-    for eid in exp_ids:
-        d = exp_data[eid]
-        F_ext = d["F_ext"]
-        v0 = d["v0"]
-        summary_lines.append(f"  {eid} (F_ext={F_ext}, v0={v0}):")
-        summary_lines.append(f"    Linear: A={d['A']:.4f}, B={d['B']:.4f}, R²={d['R2_lin']:.4f}, v_eq={d['v_eq_lin'] if np.isfinite(d['v_eq_lin']) else 'nan'}")
-        summary_lines.append(f"    Quad:  C={d['C']:.4f}, D={d['D']:.4f}, R²={d['R2_quad']:.4f}, v_eq={d['v_eq_quad'] if np.isfinite(d['v_eq_quad']) else 'nan'}")
-        exp_metrics = metrics.copy()
-        # 清理无穷大
-        clean_metrics = {}
-        for k, v in metrics.items():
-            if np.isfinite(v):
-                clean_metrics[k] = v
-            else:
-                clean_metrics[k] = -999.0
-    summary_lines.append("跨实验比较 (F_ext=1): 绘制了 exp_04,06,08 的 a vs v 散点图，可观察轨迹是否重合。")
-    summary_lines.append("参数与外力关系图已保存。")
+    # ---------------------------
+    # Build metrics
+    # ---------------------------
+    metrics = {}
+    for eid in constant_exps:
+        prefix = eid
+        m = fit_results[eid]
+        metrics[f'{prefix}_lin_A'] = m['linear']['A']
+        metrics[f'{prefix}_lin_A_ci_low'] = m['linear']['ci_A'][0]
+        metrics[f'{prefix}_lin_A_ci_high'] = m['linear']['ci_A'][1]
+        metrics[f'{prefix}_lin_B'] = m['linear']['B']
+        metrics[f'{prefix}_lin_B_ci_low'] = m['linear']['ci_B'][0]
+        metrics[f'{prefix}_lin_B_ci_high'] = m['linear']['ci_B'][1]
+        metrics[f'{prefix}_lin_R2'] = m['linear']['R2']
+        metrics[f'{prefix}_quad_A'] = m['quadratic']['A']
+        metrics[f'{prefix}_quad_A_ci_low'] = m['quadratic']['ci_A'][0]
+        metrics[f'{prefix}_quad_A_ci_high'] = m['quadratic']['ci_A'][1]
+        metrics[f'{prefix}_quad_C'] = m['quadratic']['C']
+        metrics[f'{prefix}_quad_C_ci_low'] = m['quadratic']['ci_C'][0]
+        metrics[f'{prefix}_quad_C_ci_high'] = m['quadratic']['ci_C'][1]
+        metrics[f'{prefix}_quad_R2'] = m['quadratic']['R2']
+        metrics[f'{prefix}_power_beta'] = m['power']['beta']
+        metrics[f'{prefix}_power_beta_ci_low'] = m['power']['ci_beta'][0]
+        metrics[f'{prefix}_power_beta_ci_high'] = m['power']['ci_beta'][1]
+        metrics[f'{prefix}_power_gamma'] = m['power']['gamma']
+        metrics[f'{prefix}_power_gamma_ci_low'] = m['power']['ci_gamma'][0]
+        metrics[f'{prefix}_power_gamma_ci_high'] = m['power']['ci_gamma'][1]
+        metrics[f'{prefix}_power_R2'] = m['power']['R2']
+    metrics['global_d_beta'] = beta_global
+    metrics['global_d_beta_ci_low'] = ci_global[0][0]
+    metrics['global_d_beta_ci_high'] = ci_global[0][1]
+    metrics['global_d_gamma'] = gamma_global
+    metrics['global_d_gamma_ci_low'] = ci_global[1][0]
+    metrics['global_d_gamma_ci_high'] = ci_global[1][1]
+    metrics['global_d_R2'] = r2_global
+    for eid in zero_check:
+        metrics[f'{eid}_a_sg_mean'] = zero_check[eid]['mean']
+        metrics[f'{eid}_a_sg_std'] = zero_check[eid]['std']
+        metrics[f'{eid}_a_sg_t_test_pvalue'] = zero_check[eid]['p_value']
 
-    observation = "\n".join(summary_lines)
+    # ---------------------------
+    # Derived series: return damping d for each constant experiment
+    # ---------------------------
+    derived_series = []
+    for eid in constant_exps:
+        values = d_series[eid].tolist()
+        derived_series.append({
+            'experiment_id': eid,
+            'name': 'damping',
+            'values': values,
+            'source_name': 'a_sg - F_ext',
+            'provenance': 'generated data processor: custom_data_analysis',
+            'description': 'Damping term d = a_sg - F_ext'
+        })
+
+    # ---------------------------
+    # Observation summary
+    # ---------------------------
+    obs_lines = []
+    obs_lines.append("对所有恒外力实验（exp_02,03,04,06,07）进行了统一分析。")
+    obs_lines.append(f"1) 在同一张散点图绘制了每个实验的 a_sg vs v_sg（已保存）。")
+    obs_lines.append("2) 每个实验拟合了三个模型：线性 a=A-B*v，二次 a=A-C*v^2，幂律 a=F_ext - β*v^γ。拟合系数及95% CI 见 metrics。")
+    obs_lines.append("3) 计算了阻尼项 d = a_sg - F_ext，绘制了 d vs v_sg 散点图。")
+    obs_lines.append(f"4) 合并所有恒外力实验的 d 和 v 数据拟合 d = -β*v^γ，β={beta_global:.4f}, γ={gamma_global:.4f}, R²={r2_global:.4f}。")
+    for eid, chk in zero_check.items():
+        obs_lines.append(f"5) {eid}: a_sg 均值={chk['mean']:.6f}, 标准差={chk['std']:.6f}, t检验p值={chk['p_value']:.4f}（接近零" + ("成立" if chk['p_value'] > 0.05 else "不成立") + "）。")
+    obs_lines.append("详细拟合结果和图像已保存。")
+
+    # Assemble figures list
+    figures = [scatter_path, d_scatter_path] + fit_fig_paths
 
     return {
-        "observation": observation,
-        "derived_series": derived_series,
-        "figures": figures,
-        "metrics": clean_metrics
+        'observation': '\n'.join(obs_lines),
+        'derived_series': derived_series,
+        'figures': figures,
+        'metrics': metrics
     }

@@ -1,250 +1,188 @@
+import os
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import os
-from typing import List, Dict, Any
-
-def _compute_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """计算 R² = 1 - SS_res/SS_tot"""
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    if ss_tot == 0:
-        return 0.0
-    return 1.0 - ss_res / ss_tot
-
-def _residual_std(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """计算残差标准差（有偏，除以n）"""
-    n = len(y_true)
-    if n <= 2:
-        return 0.0
-    return np.sqrt(np.sum((y_true - y_pred) ** 2) / (n - 2))  # 与polyfit一致（使用n-2自由度）
+from scipy import stats
 
 def process(payload: dict) -> dict:
-    # ---- 提取参数 ----
-    params = payload.get("parameters", {})
-    exp_ids: List[str] = params.get("experiment_ids", [])
-    if not exp_ids:
-        # 如果没有指定，默认处理所有恒定外力实验（根据上下文，避免错误）
-        exp_ids = ["exp_02", "exp_03", "exp_04", "exp_05"]
-
-    experiments: Dict[str, Any] = payload.get("experiments", {})
-    output_dir: str = payload.get("output_dir", ".")
-
-    # ---- 存储结果 ----
-    derived_series: List[Dict] = []
-    figures: List[str] = []
-    metrics: Dict[str, Any] = {}
-
-    # ---- 遍历每个实验，计算序列和拟合 ----
-    for eid in exp_ids:
-        if eid not in experiments:
-            raise ValueError(f"Experiment {eid} not found in payload.")
-        exp = experiments[eid]
-        config = exp.get("config", {})
-        series = exp.get("series", {})
-        available = exp.get("available_series", [])
-
-        # 获取外力 F_ext
-        if "F_ext" in config:
-            F_ext = float(config["F_ext"])
-        elif "constant_force" in config:
-            F_ext = float(config["constant_force"])
-        else:
-            # 尝试从 force_field_type 推断
-            if config.get("force_field_type") == "constant":
-                # 从可用的序列中无法知道，但根据历史应已明确
-                raise ValueError(f"Experiment {eid}: cannot determine F_ext from config. "
-                                 "Expect 'F_ext' or 'constant_force' field.")
+    params = payload["parameters"]
+    experiment_ids = params.get("experiment_ids", [])
+    output_dir = payload["output_dir"]
+    experiments = payload["experiments"]
+    
+    # 辅助函数：构建实验键
+    def exp_key(eid):
+        return f"exp_{eid:02d}"
+    
+    # 检查实验都存在
+    for eid in experiment_ids:
+        key = exp_key(eid)
+        if key not in experiments:
+            raise ValueError(f"Experiment {key} not found in payload")
+    
+    # 存储结果
+    derived_series_list = []
+    metrics = {}
+    figures = []
+    
+    # 准备画图：normalized_drag随时间变化
+    fig1, axs1 = plt.subplots(len(experiment_ids), 1, figsize=(8, 4*len(experiment_ids)))
+    if len(experiment_ids) == 1:
+        axs1 = [axs1]
+    
+    # drag vs sqrt(v)拟合图
+    fig2, axs2 = plt.subplots(len(experiment_ids), 1, figsize=(8, 4*len(experiment_ids)))
+    if len(experiment_ids) == 1:
+        axs2 = [axs2]
+    
+    for idx, eid in enumerate(experiment_ids):
+        key = exp_key(eid)
+        exp = experiments[key]
+        config = exp["config"]
+        series = exp["series"]
+        
+        # 获取F_ext（优先使用F_ext字段，若不存在尝试constant_force）
+        F_ext = config.get("F_ext", None)
+        if F_ext is None:
+            F_ext = config.get("constant_force", 0.0)
+        
+        # 获取必要序列
+        if "drag" not in series:
+            raise ValueError(f"Experiment {key} does not have drag series")
+        if "v_est" not in series:
+            # 尝试velocity
+            if "velocity" in series:
+                v_est = np.array(series["velocity"])
             else:
-                raise ValueError(f"Experiment {eid}: force field is not constant, could not normalize.")
-
-        if F_ext == 0.0:
-            raise ValueError(f"Experiment {eid}: F_ext is zero, cannot normalize.")
-
-        # 检查必需序列
-        for sname in ["a_sg", "v_sg"]:
-            if sname not in series:
-                raise ValueError(f"Experiment {eid}: required series '{sname}' not available.")
-        t = np.array(series.get("t", []))
-        a_sg = np.array(series["a_sg"])
-        v_sg = np.array(series["v_sg"])
-        n = len(t)
-        if len(a_sg) != n or len(v_sg) != n:
-            raise ValueError(f"Experiment {eid}: length mismatch among series.")
-
-        # 计算归一化序列
-        a_over_F = a_sg / F_ext
-        v_over_F = v_sg / F_ext
-        v2_over_F = v_sg ** 2 / F_ext   # 注意平方除以F，与需求一致
-
-        # ---- 线性模型 a/F = c0 + c1 * (v^2/F) ----
-        coeffs_lin = np.polyfit(v2_over_F, a_over_F, 1)  # [c1, c0]
-        c1, c0 = coeffs_lin
-        pred_lin = c0 + c1 * v2_over_F
-        resid_lin = a_over_F - pred_lin
-        r2_lin = _compute_r2(a_over_F, pred_lin)
-        resid_std_lin = _residual_std(a_over_F, pred_lin)
-
-        # ---- 二次模型 a/F = c0 + c1*(v/F) + c2*(v/F)^2 ----
-        coeffs_quad = np.polyfit(v_over_F, a_over_F, 2)  # [c2, c1, c0]
-        c2, c1_q, c0_q = coeffs_quad
-        pred_quad = c0_q + c1_q * v_over_F + c2 * v_over_F ** 2
-        resid_quad = a_over_F - pred_quad
-        r2_quad = _compute_r2(a_over_F, pred_quad)
-        resid_std_quad = _residual_std(a_over_F, pred_quad)
-
-        # ---- 存储指标 ----
-        prefix = eid
-        metrics[f"{prefix}_linear_c0"] = c0
-        metrics[f"{prefix}_linear_c1"] = c1
-        metrics[f"{prefix}_linear_R2"] = r2_lin
-        metrics[f"{prefix}_linear_residual_std"] = resid_std_lin
-        metrics[f"{prefix}_quad_c0"] = c0_q
-        metrics[f"{prefix}_quad_c1"] = c1_q
-        metrics[f"{prefix}_quad_c2"] = c2
-        metrics[f"{prefix}_quad_R2"] = r2_quad
-        metrics[f"{prefix}_quad_residual_std"] = resid_std_quad
-
-        # ---- 派生序列（残差） ----
-        derived_series.append({
-            "experiment_id": eid,
-            "name": "linear_residual_a_over_F",
-            "values": resid_lin.tolist(),
-            "source_name": f"a_sg/F_ext - (c0 + c1*(v_sg^2/F_ext)), linear fit",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"线性模型残差 (a/F - (c0 + c1*v^2/F))"
-        })
-        derived_series.append({
-            "experiment_id": eid,
-            "name": "quad_residual_a_over_F",
-            "values": resid_quad.tolist(),
-            "source_name": f"a_sg/F_ext - (c0 + c1*(v_sg/F_ext) + c2*(v_sg/F_ext)^2), quadratic fit",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"二次模型残差 (a/F - (c0 + c1*v/F + c2*(v/F)^2))"
-        })
-
-    # ---- 绘图 ----
-    # 1. 线性模型图: a/F vs v^2/F，每个实验一个子图
-    fig_lin, axes_lin = plt.subplots(2, 2, figsize=(12, 10))
-    axes_lin = axes_lin.flatten()
-    for idx, eid in enumerate(exp_ids):
-        ax = axes_lin[idx]
-        exp = experiments[eid]
-        series = exp["series"]
-        config = exp["config"]
-        F_ext = float(config.get("F_ext", config.get("constant_force", 1)))
-        a_over_F = np.array(series["a_sg"]) / F_ext
-        v2_over_F = np.array(series["v_sg"]) ** 2 / F_ext
-        # 从已计算的指标中获取系数
-        c0 = metrics[f"{eid}_linear_c0"]
-        c1 = metrics[f"{eid}_linear_c1"]
-        r2 = metrics[f"{eid}_linear_R2"]
-        resid_std = metrics[f"{eid}_linear_residual_std"]
-        # 散点
-        ax.scatter(v2_over_F, a_over_F, s=20, alpha=0.6, label="data")
-        # 拟合线（排序点）
-        x_sort = np.sort(v2_over_F)
-        y_fit = c0 + c1 * x_sort
-        ax.plot(x_sort, y_fit, 'r-', lw=2, label=f"fit: c0={c0:.4f}, c1={c1:.4f}")
-        ax.set_title(f"Experiment {eid} (F_ext={F_ext})")
-        ax.set_xlabel(r"$v_{sg}^2 / F_{\mathrm{ext}}$")
-        ax.set_ylabel(r"$a_{sg} / F_{\mathrm{ext}}$")
-        ax.legend(fontsize=8)
-        ax.text(0.05, 0.95, f"R²={r2:.4f}\nσ_res={resid_std:.4f}",
-                transform=ax.transAxes, fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    plt.tight_layout()
-    path_lin = os.path.join(output_dir, "a_over_F_vs_v2_over_F_linear.png")
-    fig_lin.savefig(path_lin, dpi=150)
-    plt.close(fig_lin)
-    figures.append(path_lin)
-
-    # 2. 二次模型图: a/F vs v/F，每个实验一个子图
-    fig_quad, axes_quad = plt.subplots(2, 2, figsize=(12, 10))
-    axes_quad = axes_quad.flatten()
-    for idx, eid in enumerate(exp_ids):
-        ax = axes_quad[idx]
-        exp = experiments[eid]
-        series = exp["series"]
-        config = exp["config"]
-        F_ext = float(config.get("F_ext", config.get("constant_force", 1)))
-        a_over_F = np.array(series["a_sg"]) / F_ext
-        v_over_F = np.array(series["v_sg"]) / F_ext
-        c0 = metrics[f"{eid}_quad_c0"]
-        c1 = metrics[f"{eid}_quad_c1"]
-        c2 = metrics[f"{eid}_quad_c2"]
-        r2 = metrics[f"{eid}_quad_R2"]
-        resid_std = metrics[f"{eid}_quad_residual_std"]
-        ax.scatter(v_over_F, a_over_F, s=20, alpha=0.6, label="data")
-        x_sort = np.sort(v_over_F)
-        y_fit = c0 + c1 * x_sort + c2 * x_sort ** 2
-        ax.plot(x_sort, y_fit, 'g-', lw=2, label=f"fit: c0={c0:.4f}, c1={c1:.4f}, c2={c2:.4f}")
-        ax.set_title(f"Experiment {eid} (F_ext={F_ext})")
-        ax.set_xlabel(r"$v_{sg} / F_{\mathrm{ext}}$")
-        ax.set_ylabel(r"$a_{sg} / F_{\mathrm{ext}}$")
-        ax.legend(fontsize=7)
-        ax.text(0.05, 0.95, f"R²={r2:.4f}\nσ_res={resid_std:.4f}",
-                transform=ax.transAxes, fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.5))
-    plt.tight_layout()
-    path_quad = os.path.join(output_dir, "a_over_F_vs_v_over_F_quad.png")
-    fig_quad.savefig(path_quad, dpi=150)
-    plt.close(fig_quad)
-    figures.append(path_quad)
-
-    # 3. 残差图: 每个实验的线性残差和二次残差，合并在一张大图上
-    fig_res, axes_res = plt.subplots(2, 2, figsize=(12, 10))
-    axes_res = axes_res.flatten()
-    for idx, eid in enumerate(exp_ids):
-        ax = axes_res[idx]
-        exp = experiments[eid]
-        series = exp["series"]
+                raise ValueError(f"Experiment {key} does not have v_est or velocity series")
+        else:
+            v_est = np.array(series["v_est"])
+        
+        drag = np.array(series["drag"])
         t = np.array(series["t"])
-        # 从已注册的派生序列中获取残差（我们刚刚生成，但也可以通过metrics重新计算）
-        # 为避免重复计算，我们直接从之前存储的指标？但残差序列已生成，但我们有数据
-        # 直接使用已存储的派生序列，但可能还没加入payload；为了简便，重新计算一次
-        config = exp["config"]
-        F_ext = float(config.get("F_ext", config.get("constant_force", 1)))
-        a_over_F = np.array(series["a_sg"]) / F_ext
-        v_over_F = np.array(series["v_sg"]) / F_ext
-        v2_over_F = np.array(series["v_sg"]) ** 2 / F_ext
-        c0_lin = metrics[f"{eid}_linear_c0"]
-        c1_lin = metrics[f"{eid}_linear_c1"]
-        pred_lin = c0_lin + c1_lin * v2_over_F
-        resid_lin = a_over_F - pred_lin
-        c0_q = metrics[f"{eid}_quad_c0"]
-        c1_q = metrics[f"{eid}_quad_c1"]
-        c2_q = metrics[f"{eid}_quad_c2"]
-        pred_quad = c0_q + c1_q * v_over_F + c2_q * v_over_F ** 2
-        resid_quad = a_over_F - pred_quad
-        ax.plot(t, resid_lin, 'r-', lw=1.5, label="linear residual")
-        ax.plot(t, resid_quad, 'b--', lw=1.5, label="quad residual")
-        ax.axhline(0, color='gray', linestyle=':')
-        ax.set_title(f"Experiment {eid} residuals")
-        ax.set_xlabel("t")
-        ax.set_ylabel("Residual")
-        ax.legend(fontsize=8)
-    plt.tight_layout()
-    path_res = os.path.join(output_dir, "residual_linear_and_quad.png")
-    fig_res.savefig(path_res, dpi=150)
-    plt.close(fig_res)
-    figures.append(path_res)
-
-    # ---- 构造 observation ----
-    obs_lines = []
-    obs_lines.append(f"对实验 {exp_ids} 进行了归一化加速度 a_sg/F_ext 与归一化速度平方 v_sg^2/F_ext 的线性模型拟合，及与 v_sg/F_ext 的二次模型拟合。")
-    for eid in exp_ids:
-        obs_lines.append(f"\n实验 {eid}:")
-        obs_lines.append(f"  线性模型 a/F = c0 + c1*(v^2/F): c0={metrics[f'{eid}_linear_c0']:.4f}, c1={metrics[f'{eid}_linear_c1']:.4f}, R²={metrics[f'{eid}_linear_R2']:.4f}, 残差标准差={metrics[f'{eid}_linear_residual_std']:.4f}")
-        obs_lines.append(f"  二次模型 a/F = c0 + c1*(v/F) + c2*(v/F)^2: c0={metrics[f'{eid}_quad_c0']:.4f}, c1={metrics[f'{eid}_quad_c1']:.4f}, c2={metrics[f'{eid}_quad_c2']:.4f}, R²={metrics[f'{eid}_quad_R2']:.4f}, 残差标准差={metrics[f'{eid}_quad_residual_std']:.4f}")
-    obs_lines.append("\n已生成图像：线性拟合图、二次拟合图、残差组合图。")
-    obs_lines.append("\n已返回每个实验的线性残差和二次残差派生序列。")
-    observation = "".join(obs_lines)
-
+        
+        # 确保长度一致
+        n = len(t)
+        if len(drag) != n or len(v_est) != n:
+            raise ValueError(f"Series length mismatch in {key}: t={n}, drag={len(drag)}, v_est={len(v_est)}")
+        
+        # 计算normalized_drag
+        sqrt_v = np.sqrt(np.maximum(v_est, 1e-12))  # 防止负数或零，但假设v_est>=0
+        denominator = F_ext * sqrt_v
+        # 避免除零（分母不可能为零除非F_ext=0，但F_ext=1或2）
+        if np.any(denominator == 0):
+            # 对于极少情况v_est=0且F_ext>0，标记为非正常
+            normalized_drag = np.divide(drag, denominator, out=np.full_like(drag, np.nan), where=denominator>0)
+        else:
+            normalized_drag = drag / denominator
+        
+        # 统计量
+        nd_mean = np.nanmean(normalized_drag)
+        nd_std = np.nanstd(normalized_drag)
+        nd_min = np.nanmin(normalized_drag)
+        nd_max = np.nanmax(normalized_drag)
+        nd_range = nd_max - nd_min
+        nd_std_ratio = nd_std / nd_mean if nd_mean != 0 else np.inf
+        
+        # 判断是否近似常数（相对标准差<0.1）
+        is_constant = nd_std_ratio < 0.1
+        
+        # 记录metrics
+        pref = f"exp{eid:02d}"
+        metrics[f"{pref}_normalized_drag_mean"] = round(nd_mean, 6)
+        metrics[f"{pref}_normalized_drag_std"] = round(nd_std, 6)
+        metrics[f"{pref}_normalized_drag_min"] = round(nd_min, 6)
+        metrics[f"{pref}_normalized_drag_max"] = round(nd_max, 6)
+        metrics[f"{pref}_normalized_drag_range"] = round(nd_range, 6)
+        metrics[f"{pref}_normalized_drag_std_ratio"] = round(nd_std_ratio, 6)
+        metrics[f"{pref}_normalized_drag_is_constant"] = is_constant
+        
+        # 添加派生序列
+        derived_series_list.append({
+            "experiment_id": key,
+            "name": "normalized_drag",
+            "values": normalized_drag.tolist(),
+            "source_name": f"drag / (F_ext * sqrt(v_est)), F_ext={F_ext}",
+            "provenance": "custom_data_analysis: drag / (F_ext * sqrt(v_est))",
+            "description": "Normalized drag by external force and sqrt(velocity)"
+        })
+        
+        # 绘制normalized_drag vs time
+        ax = axs1[idx]
+        ax.plot(t, normalized_drag, 'b-', linewidth=1)
+        ax.set_xlabel('Time')
+        ax.set_ylabel('normalized_drag')
+        ax.set_title(f'{key}: F_ext={F_ext}')
+        ax.grid(True)
+        
+        # drag vs sqrt(v)拟合（过原点）
+        x = sqrt_v
+        y = drag
+        # 过滤无效值
+        mask = np.isfinite(x) & np.isfinite(y) & (x > 0)
+        x_ok = x[mask]
+        y_ok = y[mask]
+        
+        if len(x_ok) < 2:
+            slope = np.nan
+            r2 = np.nan
+        else:
+            # 过原点线性回归：y = k * x
+            # 最小二乘解：k = (x^T y) / (x^T x)
+            k = np.dot(x_ok, y_ok) / np.dot(x_ok, x_ok)
+            y_pred = k * x_ok
+            ss_res = np.sum((y_ok - y_pred) ** 2)
+            ss_tot = np.sum(y_ok ** 2)  # 过原点总平方和是y^2和
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            slope = k
+        
+        metrics[f"{pref}_drag_sqrtv_slope"] = round(slope, 6) if np.isfinite(slope) else None
+        metrics[f"{pref}_drag_sqrtv_R2"] = round(r2, 6) if np.isfinite(r2) else None
+        
+        # 绘制drag vs sqrt(v)散点图和拟合线
+        ax2 = axs2[idx]
+        ax2.scatter(sqrt_v, drag, s=10, alpha=0.6, label='data')
+        if np.isfinite(slope):
+            x_line = np.linspace(sqrt_v.min(), sqrt_v.max(), 100)
+            ax2.plot(x_line, slope * x_line, 'r-', label=f'fit: k={slope:.4f}, R²={r2:.4f}')
+        ax2.set_xlabel('sqrt(v_est)')
+        ax2.set_ylabel('drag')
+        ax2.set_title(f'{key}: F_ext={F_ext}')
+        ax2.legend()
+        ax2.grid(True)
+    
+    # 保存图像
+    fig1.tight_layout()
+    path1 = os.path.join(output_dir, "normalized_drag_time.png")
+    fig1.savefig(path1, dpi=150)
+    plt.close(fig1)
+    figures.append(path1)
+    
+    fig2.tight_layout()
+    path2 = os.path.join(output_dir, "drag_vs_sqrtv_fit.png")
+    fig2.savefig(path2, dpi=150)
+    plt.close(fig2)
+    figures.append(path2)
+    
+    # 构建observation
+    lines = []
+    for eid in experiment_ids:
+        pref = f"exp{eid:02d}"
+        mean = metrics[f"{pref}_normalized_drag_mean"]
+        std = metrics[f"{pref}_normalized_drag_std"]
+        rng = metrics[f"{pref}_normalized_drag_range"]
+        const = metrics[f"{pref}_normalized_drag_is_constant"]
+        slope = metrics[f"{pref}_drag_sqrtv_slope"]
+        r2 = metrics[f"{pref}_drag_sqrtv_R2"]
+        lines.append(f"{pref}: normalized_drag mean={mean}, std={std}, range={rng}, constant? {const}; drag vs sqrt(v) slope={slope}, R²={r2}")
+    
+    observation = "分析了实验 " + ", ".join([f"exp{eid:02d}" for eid in experiment_ids]) + "。\n" + "\n".join(lines)
+    observation += "\n图像已保存至 " + ", ".join(figures)
+    
     return {
         "observation": observation,
-        "derived_series": derived_series,
+        "derived_series": derived_series_list,
         "figures": figures,
         "metrics": metrics
     }

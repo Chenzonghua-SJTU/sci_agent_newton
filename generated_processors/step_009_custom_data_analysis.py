@@ -1,209 +1,417 @@
+import json
+import math
 import numpy as np
-from scipy.signal import savgol_filter
+import pandas as pd
+from scipy import signal, stats
+from sklearn.linear_model import LinearRegression
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import os
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
 
 def process(payload: dict) -> dict:
-    action = payload["action"]
-    params = payload["parameters"]
-    experiments = payload["experiments"]
-    output_dir = payload.get("output_dir", ".")
+    # Extract parameters
+    params = payload.get("parameters", {})
+    experiment_ids = params.get("experiment_ids", [])
+    if not experiment_ids:
+        experiment_ids = list(payload.get("experiments", {}).keys())
+    
+    experiments = payload.get("experiments", {})
+    output_dir = Path(payload.get("output_dir", "."))
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 确定要处理的实验
-    exp_ids = params.get("experiment_ids", [])
-    if not exp_ids:
-        exp_id = params.get("experiment_id")
-        if exp_id:
-            exp_ids = [exp_id]
-        else:
-            exp_ids = list(experiments.keys())
+    # Ensure we have the required experiments
+    missing = [eid for eid in experiment_ids if eid not in experiments]
+    if missing:
+        raise ValueError(f"Missing experiments: {missing}")
 
-    # 只保留在 experiments 中存在的实验
-    exp_ids = [eid for eid in exp_ids if eid in experiments]
-    if not exp_ids:
-        raise ValueError("No valid experiments found.")
-
-    window_length = 11
+    # Savitzky-Golay parameters (consistent with earlier steps)
+    window_length = 7
     polyorder = 3
-    dt = None
+    dt = 0.1  # will be taken from experiment config or default
 
+    results = {}
     derived_series_list = []
     figures = []
     metrics = {}
-    observations_parts = []
-    a_means = {}
-    quad_a_vals = {}
-    force_vals = {}
 
-    for eid in exp_ids:
+    # helper to compute v_sg, a_sg from q(t)
+    def compute_sg_series(exp_id, exp_data):
+        t = np.array(exp_data["series"]["t"], dtype=float)
+        q = np.array(exp_data["series"]["q"], dtype=float)
+        config = exp_data.get("config", {})
+        dt_val = config.get("dt", dt) if config else dt
+        # Use savgol for v and a
+        v_sg = signal.savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=1, delta=dt_val)
+        a_sg = signal.savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=2, delta=dt_val)
+        return t, q, v_sg, a_sg
+
+    # Collect data for each experiment
+    exp_data_dict = {}
+    for eid in experiment_ids:
         exp = experiments[eid]
-        config = exp["config"]
-        series = exp["series"]
-        t = np.array(series["t"])
-        q = np.array(series["q"])
-        if dt is None and len(t) > 1:
-            dt = t[1] - t[0]
-        if dt is None:
-            dt = 0.1
+        series = exp.get("series", {})
+        available = exp.get("available_series", [])
+        config = exp.get("config", {})
+        
+        # Determine F_ext
+        F_ext = config.get("F_ext", 0.0) if config else 0.0
+        # Use existing v_sg and a_sg if available, otherwise compute
+        if "v_sg" in series and "a_sg" in series:
+            t = np.array(series["t"], dtype=float)
+            q = np.array(series["q"], dtype=float) if "q" in series else None
+            v_sg = np.array(series["v_sg"], dtype=float)
+            a_sg = np.array(series["a_sg"], dtype=float)
+        else:
+            t, q, v_sg, a_sg = compute_sg_series(eid, exp)
+            # Optionally register the new series later
+            derived_series_list.append({
+                "experiment_id": eid,
+                "name": "v_sg",
+                "values": v_sg.tolist(),
+                "source_name": f"savgol_filter(window={window_length}, polyorder={polyorder}, deriv=1, delta={config.get('dt', 0.1)})",
+                "provenance": "generated data processor: custom_data_analysis",
+                "description": "velocity from Savitzky-Golay filter"
+            })
+            derived_series_list.append({
+                "experiment_id": eid,
+                "name": "a_sg",
+                "values": a_sg.tolist(),
+                "source_name": f"savgol_filter(window={window_length}, polyorder={polyorder}, deriv=2, delta={config.get('dt', 0.1)})",
+                "provenance": "generated data processor: custom_data_analysis",
+                "description": "acceleration from Savitzky-Golay filter"
+            })
+        # Ensure q is available (not all experiments have q in series if not registered)
+        if "q" not in series:
+            # compute from original? but original should always have q
+            # fallback: if not present, we might need to read from original experiment data
+            # we assume it's there
+            raise ValueError(f"Experiment {eid} missing 'q' series.")
+        q = np.array(series["q"], dtype=float)
+        t = np.array(series["t"], dtype=float)
 
-        # 用 Savitzky-Golay 滤波同时估计平滑位置、速度、加速度
-        q_smooth = savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=0)
-        v_smooth = savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=1, delta=dt)
-        a_smooth = savgol_filter(q, window_length=window_length, polyorder=polyorder, deriv=2, delta=dt)
+        exp_data_dict[eid] = {
+            "t": t,
+            "q": q,
+            "v_sg": v_sg,
+            "a_sg": a_sg,
+            "F_ext": F_ext,
+            "config": config
+        }
 
-        a_mean = float(np.mean(a_smooth))
-        a_std = float(np.std(a_smooth))
-        a_means[eid] = a_mean
+    # --- 1. a_sg vs v_sg: linear and quadratic fit ---
+    fit_linear_results = {}
+    fit_quad_results = {}
+    for eid in experiment_ids:
+        d = exp_data_dict[eid]
+        v = d["v_sg"]
+        a = d["a_sg"]
+        # Remove possible NaNs (from edge effects of savgol)
+        mask = ~(np.isnan(v) | np.isnan(a))
+        v_clean = v[mask]
+        a_clean = a[mask]
+        if len(v_clean) < 3:
+            continue
+        # Linear: a = alpha + beta * v
+        A = np.vstack([np.ones_like(v_clean), v_clean]).T
+        coeff_lin, resid_lin, _, _ = np.linalg.lstsq(A, a_clean, rcond=None)
+        alpha_lin, beta_lin = coeff_lin
+        # R^2
+        ss_res = resid_lin[0] if len(resid_lin) > 0 else np.sum((a_clean - A @ coeff_lin)**2)
+        ss_tot = np.sum((a_clean - np.mean(a_clean))**2)
+        r2_lin = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        # Quadratic: a = alpha + gamma * v^2
+        v2 = v_clean ** 2
+        A2 = np.vstack([np.ones_like(v2), v2]).T
+        coeff_quad, resid_quad, _, _ = np.linalg.lstsq(A2, a_clean, rcond=None)
+        alpha_quad, gamma_quad = coeff_quad
+        ss_res_q = resid_quad[0] if len(resid_quad) > 0 else np.sum((a_clean - A2 @ coeff_quad)**2)
+        r2_quad = 1 - ss_res_q / ss_tot if ss_tot > 0 else 0.0
+        fit_linear_results[eid] = {
+            "alpha": alpha_lin,
+            "beta": beta_lin,
+            "R2": r2_lin
+        }
+        fit_quad_results[eid] = {
+            "alpha": alpha_quad,
+            "gamma": gamma_quad,
+            "R2": r2_quad
+        }
+        # Store metrics
+        metrics[f"{eid}_lin_alpha"] = alpha_lin
+        metrics[f"{eid}_lin_beta"] = beta_lin
+        metrics[f"{eid}_lin_R2"] = r2_lin
+        metrics[f"{eid}_quad_alpha"] = alpha_quad
+        metrics[f"{eid}_quad_gamma"] = gamma_quad
+        metrics[f"{eid}_quad_R2"] = r2_quad
 
-        # 获取外力
-        F_ext = config.get("constant_force")
-        if F_ext is None:
-            F_ext = config.get("F_ext")
-        if F_ext is None:
-            F_ext = 0.0
-        force_vals[eid] = float(F_ext)
-
-        # q_smooth vs t^2 线性拟合
-        t2 = t ** 2
-        coeffs_linear = np.polyfit(t2, q_smooth, 1)  # [k, b]
-        k_linear = float(coeffs_linear[0])
-        b_linear = float(coeffs_linear[1])
-        q_pred_linear = np.polyval(coeffs_linear, t2)
-        mse_linear = float(np.mean((q_smooth - q_pred_linear) ** 2))
-
-        # 二次多项式拟合 q_smooth vs t
-        coeffs_quad = np.polyfit(t, q_smooth, 2)  # [a, b, c]
-        a_quad, b_quad, c_quad = [float(v) for v in coeffs_quad]
-        q_pred_quad = np.polyval(coeffs_quad, t)
-        mse_quad = float(np.mean((q_smooth - q_pred_quad) ** 2))
-        quad_a_vals[eid] = a_quad
-
-        # 记录 metrics
-        metrics[f"{eid}_a_mean"] = a_mean
-        metrics[f"{eid}_a_std"] = a_std
-        metrics[f"{eid}_linear_k"] = k_linear
-        metrics[f"{eid}_linear_b"] = b_linear
-        metrics[f"{eid}_linear_mse"] = mse_linear
-        metrics[f"{eid}_quad_a"] = a_quad
-        metrics[f"{eid}_quad_b"] = b_quad
-        metrics[f"{eid}_quad_c"] = c_quad
-        metrics[f"{eid}_quad_mse"] = mse_quad
-        metrics[f"{eid}_F_ext"] = F_ext
-
-        # 添加派生序列
-        derived_series_list.append({
-            "experiment_id": eid,
-            "name": "q_smooth",
-            "values": q_smooth.tolist(),
-            "source_name": f"Savitzky-Golay filter (window={window_length}, polyorder={polyorder}) applied to q",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"Smooth position from SG filter (w={window_length}, p={polyorder})"
-        })
-        derived_series_list.append({
-            "experiment_id": eid,
-            "name": "v_smooth",
-            "values": v_smooth.tolist(),
-            "source_name": f"First derivative via Savitzky-Golay filter (window={window_length}, polyorder={polyorder})",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"Velocity from SG derivative (w={window_length}, p={polyorder})"
-        })
-        derived_series_list.append({
-            "experiment_id": eid,
-            "name": "a_smooth",
-            "values": a_smooth.tolist(),
-            "source_name": f"Second derivative via Savitzky-Golay filter (window={window_length}, polyorder={polyorder})",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"Acceleration from SG second derivative (w={window_length}, p={polyorder})"
-        })
-
-        # 观察文本
-        observations_parts.append(
-            f"实验 {eid} (F_ext={F_ext}): "
-            f"a_smooth 均值={a_mean:.6f}, 标准差={a_std:.6f}; "
-            f"q vs t^2 线性拟合 k={k_linear:.6f}, MSE={mse_linear:.6e}; "
-            f"二次拟合系数 a={a_quad:.6f}, b={b_quad:.6f}, c={c_quad:.6f}, MSE={mse_quad:.6e}."
-        )
-
-        # 绘图：每个实验的运动学图和拟合图
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        # 位置
-        axes[0, 0].plot(t, q, 'b-', alpha=0.3, label='q raw')
-        axes[0, 0].plot(t, q_smooth, 'r-', label='q_smooth')
-        axes[0, 0].set_xlabel('t')
-        axes[0, 0].set_ylabel('q')
-        axes[0, 0].legend()
-        axes[0, 0].set_title(f'{eid}: Position')
-
-        # 速度
-        axes[0, 1].plot(t, v_smooth, 'g-', label='v_smooth')
-        axes[0, 1].set_xlabel('t')
-        axes[0, 1].set_ylabel('v')
-        axes[0, 1].legend()
-        axes[0, 1].set_title('Velocity')
-
-        # 加速度
-        axes[1, 0].plot(t, a_smooth, 'm-', label='a_smooth')
-        axes[1, 0].axhline(y=a_mean, color='k', linestyle='--', alpha=0.5, label=f'mean={a_mean:.3f}')
-        axes[1, 0].fill_between(t, a_mean - a_std, a_mean + a_std, alpha=0.2, color='gray')
-        axes[1, 0].set_xlabel('t')
-        axes[1, 0].set_ylabel('a')
-        axes[1, 0].legend()
-        axes[1, 0].set_title('Acceleration')
-
-        # 拟合比较
-        axes[1, 1].plot(t, q_smooth, 'b-', label='q_smooth')
-        axes[1, 1].plot(t, q_pred_linear, 'r--', label=f'linear vs t^2: k={k_linear:.4f}')
-        axes[1, 1].plot(t, q_pred_quad, 'g:', label=f'quadratic: a={a_quad:.4f}')
-        axes[1, 1].set_xlabel('t')
-        axes[1, 1].set_ylabel('q')
-        axes[1, 1].legend()
-        axes[1, 1].set_title('Fits')
-
-        plt.tight_layout()
-        figname = f"{eid}_kinematics_fits_w{window_length}_p{polyorder}.png"
-        figpath = os.path.join(output_dir, figname)
-        plt.savefig(figpath, dpi=150)
+    # --- 2. a_sg vs q scatter plot ---
+    for eid in experiment_ids:
+        d = exp_data_dict[eid]
+        v = d["v_sg"]
+        a = d["a_sg"]
+        q_plot = d["q"]
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.scatter(q_plot, a, s=8, alpha=0.7, label=f"{eid} (F_ext={d['F_ext']})")
+        ax.set_xlabel("q")
+        ax.set_ylabel("a_sg")
+        ax.set_title(f"a_sg vs q - {eid}")
+        ax.grid(True)
+        fname = f"a_sg_vs_q_{eid}.png"
+        fig.savefig(output_dir / fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
-        figures.append(figpath)
+        figures.append(str(output_dir / fname))
 
-    # 两实验比较（仅当两个都处理了）
-    if "exp_04" in exp_ids and "exp_05" in exp_ids:
-        F04 = force_vals["exp_04"]
-        F05 = force_vals["exp_05"]
-        ratio_a = a_means["exp_05"] / a_means["exp_04"] if a_means["exp_04"] != 0 else float('nan')
-        expected_ratio = F05 / F04 if F04 != 0 else float('nan')
-        ratio_quad_a = quad_a_vals["exp_05"] / quad_a_vals["exp_04"] if quad_a_vals["exp_04"] != 0 else float('nan')
-        observations_parts.append(
-            f"比较: exp_05(F={F05}) vs exp_04(F={F04}): "
-            f"加速度均值比值 = {ratio_a:.4f} (期望力比值 = {expected_ratio:.2f}); "
-            f"二次项系数比值 = {ratio_quad_a:.4f}."
-        )
-        metrics["a_mean_ratio_exp05_exp04"] = ratio_a
-        metrics["expected_F_ratio"] = expected_ratio
-        metrics["quad_a_ratio_exp05_exp04"] = ratio_quad_a
+    # --- 3. Quadratic fit of q(t) ---
+    q_fit_results = {}
+    for eid in experiment_ids:
+        d = exp_data_dict[eid]
+        t_vals = d["t"]
+        q_vals = d["q"]
+        # quadratic: q = c0 + c1*t + c2*t^2
+        coeffs = np.polyfit(t_vals, q_vals, 2)  # returns c2, c1, c0
+        c2, c1, c0 = coeffs
+        # predicted
+        q_pred = np.polyval(coeffs, t_vals)
+        ss_res = np.sum((q_vals - q_pred)**2)
+        ss_tot = np.sum((q_vals - np.mean(q_vals))**2)
+        r2_q = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        q_fit_results[eid] = {
+            "c0": c0,
+            "c1": c1,
+            "c2": c2,
+            "R2": r2_q
+        }
+        metrics[f"{eid}_c2"] = c2
+        metrics[f"{eid}_q_fit_R2"] = r2_q
+        # compare c2 with F_ext
+        F_ext = d["F_ext"]
+        if abs(F_ext) > 1e-12:
+            ratio_c2_F = c2 / F_ext
+            metrics[f"{eid}_c2_over_F_ext"] = ratio_c2_F
+        else:
+            metrics[f"{eid}_c2_over_F_ext"] = None  # not defined
 
-        # 制两实验加速度对比图
-        fig2, ax = plt.subplots(figsize=(8, 5))
-        for eid in ["exp_04", "exp_05"]:
-            exp = experiments[eid]
-            t = np.array(exp["series"]["t"])
-            q = np.array(exp["series"]["q"])
-            # 由于同一个函数内，可以直接重新算（开销小）
-            a_s = savgol_filter(q, window_length, polyorder, deriv=2, delta=dt)
-            ax.plot(t, a_s, label=f"{eid} (F={force_vals[eid]})")
-        ax.set_xlabel('t')
-        ax.set_ylabel('a_smooth')
-        ax.legend()
-        ax.set_title('Acceleration comparison exp_04 vs exp_05')
-        figname2 = "exp04_exp05_acceleration_comparison.png"
-        figpath2 = os.path.join(output_dir, figname2)
-        plt.savefig(figpath2, dpi=150)
-        plt.close(fig2)
-        figures.append(figpath2)
+    # --- 4. Construct a_res = a_sg - F_ext, then fit vs v and v^2 ---
+    a_res_fits = {}
+    for eid in experiment_ids:
+        d = exp_data_dict[eid]
+        F_ext = d["F_ext"]
+        a_sg = d["a_sg"]
+        v_sg = d["v_sg"]
+        mask = ~(np.isnan(a_sg) | np.isnan(v_sg))
+        a_clean = a_sg[mask]
+        v_clean = v_sg[mask]
+        a_res = a_clean - F_ext
+        # Store a_res as derived series (full length, fill NaNs with interpolation? We'll output masked version?)
+        # Better to keep full length and put NaN for masked? We'll put the computed values for non-masked and np.nan for masked.
+        # To keep length same as original series, we create full array with NaN, then fill.
+        a_res_full = np.full_like(a_sg, np.nan)
+        a_res_full[mask] = a_res
+        # Add derived series
+        derived_series_list.append({
+            "experiment_id": eid,
+            "name": "a_res",
+            "values": a_res_full.tolist(),
+            "source_name": f"a_sg - F_ext (F_ext={F_ext})",
+            "provenance": "generated data processor: custom_data_analysis",
+            "description": "Residual acceleration after subtracting external force F_ext"
+        })
+        # Fit a_res = beta * v
+        # Linear through origin? The goal says "a_res = β*v" meaning no intercept.
+        # We'll do regression without intercept.
+        X_v = v_clean.reshape(-1,1)
+        model_v = LinearRegression(fit_intercept=False)
+        model_v.fit(X_v, a_res)
+        beta = model_v.coef_[0]
+        # R^2 for no-intercept: use total sum of squares about zero? or about mean? Standard R2 not meaningful without intercept.
+        # We'll compute R2 as 1 - SS_res/SS_tot (with SS_tot about zero? better about mean). Use sklearn's score.
+        # For no-intercept, sklearn uses total sum of squares centered? We'll compute manually:
+        ss_res_v = np.sum((a_res - model_v.predict(X_v))**2)
+        ss_tot_v = np.sum((a_res - np.mean(a_res))**2)
+        r2_v = 1 - ss_res_v / ss_tot_v if ss_tot_v > 0 else 0.0
+        # Fit a_res = gamma * v^2
+        v2 = v_clean ** 2
+        X_v2 = v2.reshape(-1,1)
+        model_v2 = LinearRegression(fit_intercept=False)
+        model_v2.fit(X_v2, a_res)
+        gamma = model_v2.coef_[0]
+        ss_res_v2 = np.sum((a_res - model_v2.predict(X_v2))**2)
+        r2_v2 = 1 - ss_res_v2 / ss_tot_v if ss_tot_v > 0 else 0.0
+        a_res_fits[eid] = {
+            "beta": beta,
+            "beta_R2": r2_v,
+            "gamma": gamma,
+            "gamma_R2": r2_v2
+        }
+        metrics[f"{eid}_a_res_beta"] = beta
+        metrics[f"{eid}_a_res_beta_R2"] = r2_v
+        metrics[f"{eid}_a_res_gamma"] = gamma
+        metrics[f"{eid}_a_res_gamma_R2"] = r2_v2
 
-    observation = "\n".join(observations_parts)
+    # --- 5. Statistical summaries ---
+    for eid in experiment_ids:
+        d = exp_data_dict[eid]
+        a = d["a_sg"]
+        v = d["v_sg"]
+        mask = ~(np.isnan(a) | np.isnan(v))
+        a_clean = a[mask]
+        v_clean = v[mask]
+        metrics[f"{eid}_a_sg_mean"] = float(np.mean(a_clean))
+        metrics[f"{eid}_a_sg_std"] = float(np.std(a_clean))
+        metrics[f"{eid}_v_sg_mean"] = float(np.mean(v_clean))
+        metrics[f"{eid}_v_sg_std"] = float(np.std(v_clean))
+
+    # --- Generate comparison plots ---
+    # (a) a_sg vs v_sg with linear and quadratic fits per experiment
+    # We'll create one figure per experiment showing both fits.
+    for eid in experiment_ids:
+        d = exp_data_dict[eid]
+        v = d["v_sg"]
+        a = d["a_sg"]
+        mask = ~(np.isnan(v) | np.isnan(a))
+        vp = v[mask]
+        ap = a[mask]
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.scatter(vp, ap, s=8, alpha=0.7, label=f"{eid} data (F_ext={d['F_ext']})")
+        # Generate sorted points for fit lines
+        v_sort = np.sort(vp)
+        # linear fit line
+        if eid in fit_linear_results:
+            lin = fit_linear_results[eid]
+            a_pred_lin = lin["alpha"] + lin["beta"] * v_sort
+            ax.plot(v_sort, a_pred_lin, 'r-', label=f"linear: α={lin['alpha']:.4f}, β={lin['beta']:.4f}, R2={lin['R2']:.4f}")
+        # quadratic fit (a = alpha + gamma*v^2)
+        if eid in fit_quad_results:
+            quad = fit_quad_results[eid]
+            a_pred_quad = quad["alpha"] + quad["gamma"] * v_sort**2
+            ax.plot(v_sort, a_pred_quad, 'g--', label=f"quad: α={quad['alpha']:.4f}, γ={quad['gamma']:.4f}, R2={quad['R2']:.4f}")
+        ax.set_xlabel("v_sg")
+        ax.set_ylabel("a_sg")
+        ax.set_title(f"a_sg vs v_sg - {eid}")
+        ax.legend(fontsize=7)
+        ax.grid(True)
+        fname = f"a_vs_v_fits_{eid}.png"
+        fig.savefig(output_dir / fname, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        figures.append(str(output_dir / fname))
+
+    # (b) a_res vs v (or v^2) cross-experiment comparison
+    # We'll create one figure with all experiments: a_res vs v with beta fits (through origin)
+    fig, ax = plt.subplots(figsize=(8,5))
+    colors = plt.cm.tab10(np.linspace(0,1,len(experiment_ids)))
+    for idx, eid in enumerate(experiment_ids):
+        d = exp_data_dict[eid]
+        v = d["v_sg"]
+        a = d["a_sg"]
+        mask = ~(np.isnan(v) | np.isnan(a))
+        vp = v[mask]
+        ap = a[mask]
+        a_res = ap - d["F_ext"]
+        ax.scatter(vp, a_res, s=8, alpha=0.6, color=colors[idx], label=f"{eid} (F_ext={d['F_ext']})")
+        # beta fit
+        beta_val = a_res_fits[eid]["beta"]
+        gamma_val = a_res_fits[eid]["gamma"]
+        # line for beta*v
+        v_line = np.linspace(vp.min(), vp.max(), 100)
+        ax.plot(v_line, beta_val * v_line, '--', color=colors[idx], label=f"{eid} β={beta_val:.4f}")
+    ax.set_xlabel("v_sg")
+    ax.set_ylabel("a_res = a_sg - F_ext")
+    ax.set_title("a_res vs v_sg with linear β fits (through origin)")
+    ax.legend(fontsize=6)
+    ax.grid(True)
+    fname = "a_res_vs_v_beta_comparison.png"
+    fig.savefig(output_dir / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    figures.append(str(output_dir / fname))
+
+    # (c) a_res vs v^2 with gamma fits
+    fig, ax = plt.subplots(figsize=(8,5))
+    for idx, eid in enumerate(experiment_ids):
+        d = exp_data_dict[eid]
+        v = d["v_sg"]
+        a = d["a_sg"]
+        mask = ~(np.isnan(v) | np.isnan(a))
+        vp = v[mask]
+        ap = a[mask]
+        a_res = ap - d["F_ext"]
+        v2 = vp**2
+        ax.scatter(v2, a_res, s=8, alpha=0.6, color=colors[idx], label=f"{eid} (F_ext={d['F_ext']})")
+        gamma_val = a_res_fits[eid]["gamma"]
+        v_line = np.linspace(v2.min(), v2.max(), 100)
+        ax.plot(v_line, gamma_val * v_line, '--', color=colors[idx], label=f"{eid} γ={gamma_val:.4f}")
+    ax.set_xlabel("v_sg^2")
+    ax.set_ylabel("a_res")
+    ax.set_title("a_res vs v_sg^2 with quadratic γ fits (through origin)")
+    ax.legend(fontsize=6)
+    ax.grid(True)
+    fname = "a_res_vs_v2_gamma_comparison.png"
+    fig.savefig(output_dir / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    figures.append(str(output_dir / fname))
+
+    # Collect cross-experiment comparison metrics for β and γ
+    beta_values = [a_res_fits[eid]["beta"] for eid in experiment_ids if eid in a_res_fits]
+    gamma_values = [a_res_fits[eid]["gamma"] for eid in experiment_ids if eid in a_res_fits]
+    if len(beta_values) >= 2:
+        metrics["beta_cross_mean"] = float(np.mean(beta_values))
+        metrics["beta_cross_std"] = float(np.std(beta_values, ddof=1))
+        metrics["beta_cross_rel_std"] = float(np.std(beta_values, ddof=1) / abs(np.mean(beta_values))) if abs(np.mean(beta_values)) > 1e-12 else None
+    if len(gamma_values) >= 2:
+        metrics["gamma_cross_mean"] = float(np.mean(gamma_values))
+        metrics["gamma_cross_std"] = float(np.std(gamma_values, ddof=1))
+        metrics["gamma_cross_rel_std"] = float(np.std(gamma_values, ddof=1) / abs(np.mean(gamma_values))) if abs(np.mean(gamma_values)) > 1e-12 else None
+
+    # Also compute average c2/F_ext for constant force experiments (excluding free)
+    const_exps = [eid for eid in experiment_ids if abs(exp_data_dict[eid]["F_ext"]) > 1e-12]
+    c2_ratios = [metrics.get(f"{eid}_c2_over_F_ext") for eid in const_exps if metrics.get(f"{eid}_c2_over_F_ext") is not None]
+    if c2_ratios:
+        metrics["c2_over_F_ext_mean"] = float(np.mean(c2_ratios))
+        metrics["c2_over_F_ext_std"] = float(np.std(c2_ratios, ddof=1))
+
+    # Build observation text
+    obs_lines = []
+    obs_lines.append("对所有四个实验进行了自定义分析。")
+    # Summarize fits
+    obs_lines.append("1. a_sg vs v_sg 拟合结果：")
+    for eid in experiment_ids:
+        lin = fit_linear_results.get(eid, {})
+        quad = fit_quad_results.get(eid, {})
+        obs_lines.append(f"   {eid}: 线性 α={lin.get('alpha','N/A'):.4f}, β={lin.get('beta','N/A'):.4f}, R²={lin.get('R2','N/A'):.4f}; "
+                         f"二次 α={quad.get('alpha','N/A'):.4f}, γ={quad.get('gamma','N/A'):.4f}, R²={quad.get('R2','N/A'):.4f}")
+    obs_lines.append("2. a_sg vs q 散点图已保存。")
+    obs_lines.append("3. q(t) 二次拟合结果 (c2 为二次项系数)：")
+    for eid in experiment_ids:
+        qf = q_fit_results.get(eid, {})
+        c2 = qf.get("c2", None)
+        F_ext = exp_data_dict[eid]["F_ext"]
+        if c2 is not None:
+            obs_lines.append(f"   {eid}: c2={c2:.6f}, R²={qf.get('R2','N/A'):.4f}, F_ext={F_ext}")
+            if abs(F_ext) > 1e-12:
+                ratio = metrics.get(f"{eid}_c2_over_F_ext")
+                obs_lines.append(f"        c2/F_ext = {ratio:.6f}")
+    # c2/F_ext consistency
+    if const_exps:
+        ratios_str = ", ".join([f"{eid}={metrics.get(eid+'_c2_over_F_ext','N/A'):.4f}" for eid in const_exps])
+        obs_lines.append(f"   恒外力实验 c2/F_ext: {ratios_str}")
+        if c2_ratios:
+            obs_lines.append(f"   平均 c2/F_ext = {np.mean(c2_ratios):.4f} ± {np.std(c2_ratios, ddof=1):.4f}")
+    obs_lines.append("4. 派生量 a_res = a_sg - F_ext 已计算。拟合 a_res = β*v 和 a_res = γ*v^2 结果：")
+    for eid in experiment_ids:
+        ar = a_res_fits.get(eid, {})
+        obs_lines.append(f"   {eid}: β={ar.get('beta','N/A'):.4f} (R²={ar.get('beta_R2','N/A'):.4f}), γ={ar.get('gamma','N/A'):.4f} (R²={ar.get('gamma_R2','N/A'):.4f})")
+    # cross-comparison
+    if beta_values:
+        obs_lines.append(f"   β 跨实验: 均值={np.mean(beta_values):.4f}, 样本标准差={np.std(beta_values,ddof=1):.4f}, 相对标准差={np.std(beta_values,ddof=1)/abs(np.mean(beta_values)):.4f}" if abs(np.mean(beta_values))>1e-12 else "β 均值接近0")
+    if gamma_values:
+        obs_lines.append(f"   γ 跨实验: 均值={np.mean(gamma_values):.4f}, 样本标准差={np.std(gamma_values,ddof=1):.4f}, 相对标准差={np.std(gamma_values,ddof=1)/abs(np.mean(gamma_values)):.4f}" if abs(np.mean(gamma_values))>1e-12 else "γ 均值接近0")
+    obs_lines.append("5. a_sg 和 v_sg 统计量：")
+    for eid in experiment_ids:
+        obs_lines.append(f"   {eid}: a_sg 均值={metrics.get(eid+'_a_sg_mean','N/A'):.4f}, 标准差={metrics.get(eid+'_a_sg_std','N/A'):.4f}; v_sg 均值={metrics.get(eid+'_v_sg_mean','N/A'):.4f}, 标准差={metrics.get(eid+'_v_sg_std','N/A'):.4f}")
+    obs_lines.append("图像包括每个实验的 a_sg vs v_sg 拟合图、a_sg vs q 散点图、以及 a_res 跨实验比较图。")
+    obs_lines.append("派生序列 a_res 已为每个实验返回。")
+    observation = "\n".join(obs_lines)
 
     return {
         "observation": observation,

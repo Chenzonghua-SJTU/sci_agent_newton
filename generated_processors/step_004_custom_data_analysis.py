@@ -1,153 +1,163 @@
+import json
+import math
+import statistics
+from pathlib import Path
 import numpy as np
-import scipy.stats as stats
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import os
+from scipy.signal import savgol_filter
+from typing import Any, Dict, List
 
-def process(payload: dict) -> dict:
-    # 提取参数
-    params = payload.get("parameters", {})
-    experiment_ids = params.get("experiment_ids", [])
-    if not experiment_ids:
-        # 如果没有指定，尝试从 experiments 中获取所有实验
-        experiment_ids = list(payload.get("experiments", {}).keys())
-    
-    # 只处理 exp_02（根据 action 要求）
-    if "exp_02" not in experiment_ids:
-        raise ValueError("当前任务仅指定分析 exp_02，但 experiment_ids 中未包含 exp_02")
-    
-    exp_id = "exp_02"
-    exp_data = payload["experiments"].get(exp_id)
-    if exp_data is None:
-        raise ValueError(f"实验 {exp_id} 不存在于 payload 中")
-    
-    series = exp_data.get("series", {})
-    required = ["a_estimated", "v_estimated", "q", "t"]
-    for s in required:
-        if s not in series:
-            raise ValueError(f"实验 {exp_id} 缺少必要序列 {s}")
-    
-    t = np.array(series["t"])
-    a = np.array(series["a_estimated"])
-    v = np.array(series["v_estimated"])
-    q = np.array(series["q"])
-    
-    output_dir = payload.get("output_dir", ".")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 1. 计算 a 与 v 的相关系数
-    corr_a_v = np.corrcoef(a, v)[0, 1]
-    
-    # 2. 绘制 a vs v 散点图
-    fig1, ax1 = plt.subplots()
-    ax1.scatter(v, a, s=10, alpha=0.7)
-    ax1.set_xlabel("v_estimated")
-    ax1.set_ylabel("a_estimated")
-    ax1.set_title(f"exp_{exp_id}: a vs v (corr={corr_a_v:.4f})")
-    fig1.tight_layout()
-    fig1_path = os.path.join(output_dir, f"{exp_id}_a_vs_v_scatter.png")
-    fig1.savefig(fig1_path, dpi=150)
-    plt.close(fig1)
-    
-    # 3. 线性拟合 a vs v
-    slope_v, intercept_v, r_value_v, p_value_v, std_err_v = stats.linregress(v, a)
-    a_pred_v = slope_v * v + intercept_v
-    residuals_v = a - a_pred_v
-    resid_std_v = np.std(residuals_v)
-    
-    # 4. 线性拟合 a vs q
-    slope_q, intercept_q, r_value_q, p_value_q, std_err_q = stats.linregress(q, a)
-    a_pred_q = slope_q * q + intercept_q
-    residuals_q = a - a_pred_q
-    resid_std_q = np.std(residuals_q)
-    
-    # 5. 计算组合量 a/v, a/q, a*v
-    # 注意处理除零，用 np.divide 设置 where
-    a_over_v = np.divide(a, v, out=np.full_like(a, np.nan), where=(v != 0))
-    a_over_q = np.divide(a, q, out=np.full_like(a, np.nan), where=(q != 0))
-    a_times_v = a * v
-    
-    # 计算各组合的统计量（忽略 NaN）
-    def safe_mean_std_rsd(arr):
-        valid = arr[~np.isnan(arr)]
-        if len(valid) == 0:
-            return np.nan, np.nan, np.nan
-        mean_val = np.mean(valid)
-        std_val = np.std(valid, ddof=1)  # 样本标准差
-        rsd = std_val / abs(mean_val) * 100 if mean_val != 0 else np.nan
-        return mean_val, std_val, rsd
-    
-    mean_a_over_v, std_a_over_v, rsd_a_over_v = safe_mean_std_rsd(a_over_v)
-    mean_a_over_q, std_a_over_q, rsd_a_over_q = safe_mean_std_rsd(a_over_q)
-    mean_a_times_v, std_a_times_v, rsd_a_times_v = safe_mean_std_rsd(a_times_v)
-    
-    # 构建返回 metrics
-    metrics = {
-        "corr_a_v": corr_a_v,
-        "a_vs_v_slope": slope_v,
-        "a_vs_v_intercept": intercept_v,
-        "a_vs_v_r2": r_value_v**2,
-        "a_vs_v_resid_std": resid_std_v,
-        "a_vs_pvalue": p_value_v,
-        "a_vs_q_slope": slope_q,
-        "a_vs_q_intercept": intercept_q,
-        "a_vs_q_r2": r_value_q**2,
-        "a_vs_q_resid_std": resid_std_q,
-        "a_vs_q_pvalue": p_value_q,
-        "a_over_v_mean": mean_a_over_v,
-        "a_over_v_std": std_a_over_v,
-        "a_over_v_rsd_percent": rsd_a_over_v,
-        "a_over_q_mean": mean_a_over_q,
-        "a_over_q_std": std_a_over_q,
-        "a_over_q_rsd_percent": rsd_a_over_q,
-        "a_times_v_mean": mean_a_times_v,
-        "a_times_v_std": std_a_times_v,
-        "a_times_v_rsd_percent": rsd_a_times_v
-    }
-    
-    # 构造 derived_series（长度与 t 一致）
-    derived_series = [
-        {
-            "experiment_id": exp_id,
-            "name": "a_over_v",
-            "values": a_over_v.tolist(),
-            "source_name": "a_estimated / v_estimated",
-            "provenance": "custom_data_analysis",
-            "description": "加速度与速度的比值"
-        },
-        {
-            "experiment_id": exp_id,
-            "name": "a_over_q",
-            "values": a_over_q.tolist(),
-            "source_name": "a_estimated / q",
-            "provenance": "custom_data_analysis",
-            "description": "加速度与位置的比值"
-        },
-        {
-            "experiment_id": exp_id,
-            "name": "a_times_v",
-            "values": a_times_v.tolist(),
-            "source_name": "a_estimated * v_estimated",
-            "provenance": "custom_data_analysis",
-            "description": "加速度与速度的乘积"
-        }
-    ]
-    
-    # 构建 observation 字符串
-    observation = (f"分析实验 {exp_id} 中 a_estimated 与 v_estimated 和 q 的关系。\n"
-                   f"a 与 v 的 Pearson 相关系数：{corr_a_v:.4f}\n"
-                   f"a vs v 线性拟合：a = {intercept_v:.4f} + {slope_v:.4f} * v，R²={r_value_v**2:.4f}，残差标准差={resid_std_v:.4f}\n"
-                   f"a vs q 线性拟合：a = {intercept_q:.4f} + {slope_q:.4f} * q，R²={r_value_q**2:.4f}，残差标准差={resid_std_q:.4f}\n"
-                   f"组合量统计（均值 ± 标准差，相对标准差%）：\n"
-                   f"  a/v = {mean_a_over_v:.4f} ± {std_a_over_v:.4f} (RSD={rsd_a_over_v:.2f}%)\n"
-                   f"  a/q = {mean_a_over_q:.4f} ± {std_a_over_q:.4f} (RSD={rsd_a_over_q:.2f}%)\n"
-                   f"  a*v = {mean_a_times_v:.4f} ± {std_a_times_v:.4f} (RSD={rsd_a_times_v:.2f}%)\n"
-                   f"已生成 a vs v 散点图，并返回 a_over_v, a_over_q, a_times_v 派生序列。")
-    
+def process(payload: Dict[str, Any]) -> Dict[str, Any]:
+    action = payload["action"]
+    params = payload["parameters"]
+    experiments = payload["experiments"]
+    output_dir = payload["output_dir"]
+
+    # 只处理 exp_02 和 exp_03
+    target_exps = ["exp_02", "exp_03"]
+    for eid in target_exps:
+        if eid not in experiments:
+            raise ValueError(f"Experiment {eid} not found in payload")
+
+    window = 7
+    polyorder = 2
+    dt = 0.1  # 根据上下文 dt 固定
+
+    derived_series_list = []
+    metrics_dict = {}
+    figures_list = []
+
+    # 准备画图
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10), sharex='col')
+    # 0行: v vs t; 1行: a vs t
+    colors = {'exp_02': 'blue', 'exp_03': 'red'}
+
+    for idx, eid in enumerate(target_exps):
+        exp = experiments[eid]
+        t = exp["series"]["t"]
+        q = exp["series"]["q"]
+        t_arr = np.array(t)
+        q_arr = np.array(q)
+        n = len(t_arr)
+        if len(q_arr) != n:
+            raise ValueError(f"{eid}: t and q length mismatch")
+
+        # 使用 SG 滤波器直接计算速度和加速度
+        if n < window:
+            raise ValueError(f"{eid}: too few points ({n}) for SG window {window}")
+        v_arr = savgol_filter(q_arr, window_length=window, polyorder=polyorder, deriv=1, delta=dt)
+        a_arr = savgol_filter(q_arr, window_length=window, polyorder=polyorder, deriv=2, delta=dt)
+        # 对加速度再做一次平滑？直接使用 SG 导数是合理的
+
+        # 统计信息
+        v_min = float(np.min(v_arr))
+        v_max = float(np.max(v_arr))
+        v_mean = float(np.mean(v_arr))
+        v_std = float(np.std(v_arr, ddof=1))
+        a_min = float(np.min(a_arr))
+        a_max = float(np.max(a_arr))
+        a_mean = float(np.mean(a_arr))
+        a_std = float(np.std(a_arr, ddof=1))
+
+        # 检查加速度是否恒定：计算 a 对 t 的线性回归斜率
+        coeffs = np.polyfit(t_arr, a_arr, 1)
+        a_slope = coeffs[0]  # 斜率
+        # 恒定判据：std 相对于均值（如果均值接近0则看绝对 std）
+        if abs(a_mean) > 1e-6:
+            cv = a_std / abs(a_mean)
+        else:
+            cv = a_std  # 如果均值接近0，直接看 std
+        is_constant = cv < 0.1  # 变异系数小于 0.1 视为恒定
+
+        # 已知外力
+        F_ext = exp["config"]["F_ext"]  # exp_02:0.0, exp_03:1.0
+        a_diff = a_mean - F_ext
+
+        # 记录指标
+        prefix = f"{eid}"
+        metrics_dict.update({
+            f"{prefix}_v_min": v_min,
+            f"{prefix}_v_max": v_max,
+            f"{prefix}_v_mean": v_mean,
+            f"{prefix}_v_std": v_std,
+            f"{prefix}_a_min": a_min,
+            f"{prefix}_a_max": a_max,
+            f"{prefix}_a_mean": a_mean,
+            f"{prefix}_a_std": a_std,
+            f"{prefix}_a_slope": a_slope,
+            f"{prefix}_is_constant": is_constant,
+            f"{prefix}_F_ext": F_ext,
+            f"{prefix}_a_diff_from_F_ext": a_diff,
+        })
+
+        # 注册派生序列
+        derived_series_list.append({
+            "experiment_id": eid,
+            "name": "v_sg",
+            "values": v_arr.tolist(),
+            "source_name": f"Savitzky-Golay deriv=1 (window={window}, polyorder={polyorder}) on q",
+            "provenance": "generated data processor: custom_data_analysis",
+            "description": "Velocity estimated via SG filter"
+        })
+        derived_series_list.append({
+            "experiment_id": eid,
+            "name": "a_sg",
+            "values": a_arr.tolist(),
+            "source_name": f"Savitzky-Golay deriv=2 (window={window}, polyorder={polyorder}) on q",
+            "provenance": "generated data processor: custom_data_analysis",
+            "description": "Acceleration estimated via SG filter"
+        })
+
+        # 画图
+        col = idx  # 0 for exp_02, 1 for exp_03
+        ax_v = axes[0, col]
+        ax_a = axes[1, col]
+        color = colors[eid]
+        ax_v.plot(t_arr, v_arr, color=color, label=f"{eid} v")
+        ax_v.set_title(f"{eid}: Velocity vs Time")
+        ax_v.set_ylabel("v (m/s)")
+        ax_v.grid(True)
+        ax_v.legend()
+
+        ax_a.plot(t_arr, a_arr, color=color, label=f"{eid} a")
+        ax_a.axhline(y=F_ext, color='gray', linestyle='--', label=f"F_ext={F_ext}")
+        ax_a.set_title(f"{eid}: Acceleration vs Time")
+        ax_a.set_xlabel("t (s)")
+        ax_a.set_ylabel("a (m/s^2)")
+        ax_a.grid(True)
+        ax_a.legend()
+
+    # 保存图片
+    fig.tight_layout()
+    fig_path = Path(output_dir) / "kinematics_exp_02_03.png"
+    fig.savefig(str(fig_path), dpi=150)
+    plt.close(fig)
+    figures_list.append(str(fig_path))
+
+    # 构建 observation
+    obs_lines = []
+    for eid in target_exps:
+        p = metrics_dict[f"{eid}_F_ext"]
+        am = metrics_dict[f"{eid}_a_mean"]
+        as_ = metrics_dict[f"{eid}_a_std"]
+        ic = metrics_dict[f"{eid}_is_constant"]
+        vm = metrics_dict[f"{eid}_v_mean"]
+        vs = metrics_dict[f"{eid}_v_std"]
+        ad = metrics_dict[f"{eid}_a_diff_from_F_ext"]
+        obs_lines.append(
+            f"{eid}: SG(win={window}, poly={polyorder}) derived v and a. "
+            f"v mean={vm:.4f}, std={vs:.4f}. a mean={am:.4f}, std={as_:.4f}. "
+            f"a differs from F_ext={p:.1f} by {ad:.4f}. "
+            f"Acceleration {'appears constant' if ic else 'not constant'} (std/|mean|={as_/abs(am) if abs(am)>1e-6 else as_:.4f})."
+        )
+    obs_lines.append("Plots saved: v vs t and a vs t for each experiment.")
+    observation = "\n".join(obs_lines)
+
     return {
         "observation": observation,
-        "derived_series": derived_series,
-        "figures": [fig1_path],
-        "metrics": metrics
+        "derived_series": derived_series_list,
+        "figures": figures_list,
+        "metrics": metrics_dict
     }

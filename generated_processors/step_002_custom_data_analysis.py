@@ -1,153 +1,203 @@
-import os
+import json, math, statistics, itertools, functools, collections, pathlib, typing
 import numpy as np
+import pandas as pd
+import scipy.signal
+import sklearn
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
 
 def process(payload: dict) -> dict:
-    # 解析参数
-    parameters = payload.get("parameters", {})
-    analysis_goal = parameters.get("analysis_goal", "")
-    experiment_ids = parameters.get("experiment_ids", [])
-    optional_series = parameters.get("optional_series", [])
-    expected_outputs = parameters.get("expected_outputs", [])
-    output_dir = payload.get("output_dir", ".")
-
-    # 如果没有指定 experiment_ids，尝试单 experiment_id
-    if not experiment_ids and "experiment_id" in parameters:
-        experiment_ids = [parameters["experiment_id"]]
-    if not experiment_ids:
-        experiment_ids = list(payload["experiments"].keys())
-
-    # 只处理 exp_01
-    exp_id = "exp_01"
-    if exp_id not in experiment_ids:
-        raise ValueError(f"指定的实验中不包含 {exp_id}，但分析目标明确要求 exp_01")
-
-    exp_data = payload["experiments"].get(exp_id)
-    if exp_data is None:
-        raise ValueError(f"实验 {exp_id} 不存在于 payload.experiments 中")
-
-    t = np.array(exp_data["series"].get("t"))
-    q = np.array(exp_data["series"].get("q"))
-    if t is None or q is None:
-        raise ValueError(f"实验 {exp_id} 缺少 t 或 q 序列")
-    if len(t) != len(q):
-        raise ValueError("t 和 q 长度不匹配")
-
-    # 1. 计算速度和加速度：使用中心差分（np.gradient），并沿时间轴
-    v = np.gradient(q, t)          # 一阶导
-    a = np.gradient(v, t)          # 二阶导
-
-    # 2. 计算基本统计量
-    def compute_stats(arr):
-        return {
-            "min": float(np.min(arr)),
-            "max": float(np.max(arr)),
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr))
+    # --- parameter extraction -------------------------------------------------
+    params = payload.get('parameters', {})
+    exp_ids = params.get('experiment_ids', [])
+    if not exp_ids:
+        exp_ids = list(payload['experiments'].keys())
+    if 'exp_01' not in exp_ids:
+        raise ValueError("This analysis requires experiment 'exp_01', but it is not in experiment_ids.")
+    
+    exps = payload['experiments']
+    exp = exps['exp_01']
+    series = exp['series']
+    
+    t = np.array(series['t'], dtype=float)
+    q = np.array(series['q'], dtype=float)
+    dt = t[1] - t[0]
+    
+    # --- 1. linear fit q vs t -------------------------------------------------
+    coeffs_linear = np.polyfit(t, q, 1)
+    slope = coeffs_linear[0]
+    intercept = coeffs_linear[1]
+    q_linear_fit = np.polyval(coeffs_linear, t)
+    residuals_linear = q - q_linear_fit
+    ss_res = np.sum(residuals_linear ** 2)
+    ss_tot = np.sum((q - np.mean(q)) ** 2)
+    r2_linear = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    
+    # --- 2. estimate kinematics (savgol) --------------------------------------
+    window_length = min(7, len(t) // 2 * 2 + 1)   # ensure odd
+    polyorder = 2
+    q_smooth = scipy.signal.savgol_filter(q, window_length, polyorder, deriv=0)
+    v_est = scipy.signal.savgol_filter(q, window_length, polyorder, deriv=1, delta=dt)
+    a_est = scipy.signal.savgol_filter(q, window_length, polyorder, deriv=2, delta=dt)
+    
+    # --- 3. statistics --------------------------------------------------------
+    v_mean = float(np.mean(v_est))
+    v_std = float(np.std(v_est))
+    v_min = float(np.min(v_est))
+    v_max = float(np.max(v_est))
+    a_mean = float(np.mean(a_est))
+    a_std = float(np.std(a_est))
+    a_min = float(np.min(a_est))
+    a_max = float(np.max(a_est))
+    
+    # --- 4. further fitting if trend or velocity non-zero --------------------
+    slope_nonzero = abs(slope) > 1e-8
+    velocity_nonzero = abs(v_mean) > 1e-8
+    fitted_extra = {}
+    if slope_nonzero or velocity_nonzero:
+        coeffs_quad = np.polyfit(t, q, 2)
+        a2, b2, c2 = coeffs_quad[0], coeffs_quad[1], coeffs_quad[2]
+        q_quad_fit = np.polyval(coeffs_quad, t)
+        residuals_quad = q - q_quad_fit
+        ss_res_quad = np.sum(residuals_quad ** 2)
+        r2_quad = 1.0 - ss_res_quad / ss_tot if ss_tot > 0 else 0.0
+        fitted_extra = {
+            'quadratic_coeff_a': float(a2),
+            'quadratic_coeff_b': float(b2),
+            'quadratic_coeff_c': float(c2),
+            'quadratic_R2': float(r2_quad)
         }
-
-    q_stats = compute_stats(q)
-    v_stats = compute_stats(v)
-    a_stats = compute_stats(a)
-
-    # 3. 评估是否接近常数（零）：计算 RMS 和平均绝对值
-    v_rms = np.sqrt(np.mean(v**2))
-    a_rms = np.sqrt(np.mean(a**2))
-    v_mean_abs = np.mean(np.abs(v))
-    a_mean_abs = np.mean(np.abs(a))
-
-    # 4. 绘制三子图：q(t), v(t), a(t)
-    fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
-    axes[0].plot(t, q, 'b-', label='q(t)')
-    axes[0].set_ylabel('Position q')
-    axes[0].legend()
-    axes[0].grid(True)
-
-    axes[1].plot(t, v, 'r-', label='v(t) = dq/dt')
-    axes[1].set_ylabel('Velocity')
-    axes[1].legend()
-    axes[1].grid(True)
-
-    axes[2].plot(t, a, 'g-', label='a(t) = dv/dt')
-    axes[2].set_xlabel('Time t')
-    axes[2].set_ylabel('Acceleration')
-    axes[2].legend()
-    axes[2].grid(True)
-
-    fig.suptitle(f'Kinematics from {exp_id} (dt={t[1]-t[0]:.4f})')
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-
-    # 保存图像
-    fig_filename = f"{exp_id}_kinematics_qdot_qddot.png"
-    fig_path = os.path.join(output_dir, fig_filename)
-    fig.savefig(fig_path, dpi=150)
-    plt.close(fig)
-
-    # 5. 构建 observation 字符串
-    obs_lines = [
-        f"对实验 {exp_id} 完成了速度和加速度估计（中心差分法）。",
-        f"时间点数 {len(t)}，时间范围 [{t[0]:.4f}, {t[-1]:.4f}]，采样间隔 dt={t[1]-t[0]:.6f}。",
-        f"q 统计：均值={q_stats['mean']:.6f}, 标准差={q_stats['std']:.6f}, 范围=[{q_stats['min']:.6f}, {q_stats['max']:.6f}]",
-        f"v (速度) 统计：均值={v_stats['mean']:.6f}, 标准差={v_stats['std']:.6f}, 范围=[{v_stats['min']:.6f}, {v_stats['max']:.6f}]",
-        f"a (加速度) 统计：均值={a_stats['mean']:.6f}, 标准差={a_stats['std']:.6f}, 范围=[{a_stats['min']:.6f}, {a_stats['max']:.6f}]",
-        f"速度 RMS = {v_rms:.6f}，平均 |v| = {v_mean_abs:.6f}",
-        f"加速度 RMS = {a_rms:.6f}，平均 |a| = {a_mean_abs:.6f}",
-        "评估是否接近常数（零）：",
-        f"  - 速度均值 = {v_stats['mean']:.6e}，标准差 = {v_stats['std']:.6e}，远小于 q 的范围，但均值不为零。",
-        f"  - 加速度均值 = {a_stats['mean']:.6e}，标准差 = {a_stats['std']:.6e}，数值较小。",
-        f"  - 综合 RMS 值：v_rms={v_rms:.6f}, a_rms={a_rms:.6f}，若噪声很大则可能源自数值微分放大噪声。",
-        "结论：速度和加速度均不严格为零常数，但在噪声水平下可能接近零。",
-        "返回了 v (q_dot) 和 a (q_ddot) 序列以及统计指标。图像已保存。"
-    ]
-    observation = "\n".join(obs_lines)
-
-    # 6. 构造返回
-    derived_series = [
+    
+    # --- 5. figures -----------------------------------------------------------
+    output_dir = payload['output_dir']
+    fig_paths = []
+    
+    # fig1: q vs t scatter + linear fit
+    fig1, ax1 = plt.subplots(figsize=(8, 5))
+    ax1.scatter(t, q, s=20, c='blue', label='raw q')
+    ax1.plot(t, q_linear_fit, 'r-', label=f'linear (slope={float(slope):.6f})')
+    ax1.set_xlabel('t')
+    ax1.set_ylabel('q')
+    ax1.set_title('Position q vs Time with Linear Fit')
+    ax1.legend()
+    fig1.tight_layout()
+    p1 = pathlib.Path(output_dir) / 'exp01_q_vs_t.png'
+    fig1.savefig(str(p1))
+    plt.close(fig1)
+    fig_paths.append(str(p1))
+    
+    # fig2: velocity vs t
+    fig2, ax2 = plt.subplots(figsize=(8, 5))
+    ax2.plot(t, v_est, 'g-', label='v (savgol deriv=1)')
+    ax2.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
+    ax2.set_xlabel('t')
+    ax2.set_ylabel('v')
+    ax2.set_title('Estimated Velocity vs Time')
+    ax2.legend()
+    fig2.tight_layout()
+    p2 = pathlib.Path(output_dir) / 'exp01_v_vs_t.png'
+    fig2.savefig(str(p2))
+    plt.close(fig2)
+    fig_paths.append(str(p2))
+    
+    # fig3: acceleration vs t
+    fig3, ax3 = plt.subplots(figsize=(8, 5))
+    ax3.plot(t, a_est, 'm-', label='a (savgol deriv=2)')
+    ax3.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
+    ax3.set_xlabel('t')
+    ax3.set_ylabel('a')
+    ax3.set_title('Estimated Acceleration vs Time')
+    ax3.legend()
+    fig3.tight_layout()
+    p3 = pathlib.Path(output_dir) / 'exp01_a_vs_t.png'
+    fig3.savefig(str(p3))
+    plt.close(fig3)
+    fig_paths.append(str(p3))
+    
+    # --- 6. derived series ----------------------------------------------------
+    derived = [
         {
-            "experiment_id": exp_id,
-            "name": "q_dot",
-            "values": v.tolist(),
-            "source_name": "中心差分 (np.gradient(q, t))",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": "从 q(t) 估计的速度"
+            'experiment_id': 'exp_01',
+            'name': 'q_smooth',
+            'values': q_smooth.tolist(),
+            'source_name': 'savgol_filter smoothed q',
+            'provenance': 'generated data processor: custom_data_analysis',
+            'description': 'Smoothed position using Savitzky–Golay filter (window=%d, polyorder=2)' % window_length
         },
         {
-            "experiment_id": exp_id,
-            "name": "q_ddot",
-            "values": a.tolist(),
-            "source_name": "中心差分 (np.gradient(v, t))",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": "从 v(t) 估计的加速度"
+            'experiment_id': 'exp_01',
+            'name': 'v_est',
+            'values': v_est.tolist(),
+            'source_name': 'savgol_filter derivative order 1',
+            'provenance': 'generated data processor: custom_data_analysis',
+            'description': 'Estimated velocity via Savitzky–Golay filter (deriv=1)'
+        },
+        {
+            'experiment_id': 'exp_01',
+            'name': 'a_est',
+            'values': a_est.tolist(),
+            'source_name': 'savgol_filter derivative order 2',
+            'provenance': 'generated data processor: custom_data_analysis',
+            'description': 'Estimated acceleration via Savitzky–Golay filter (deriv=2)'
+        },
+        {
+            'experiment_id': 'exp_01',
+            'name': 'q_linear_fit_residual',
+            'values': residuals_linear.tolist(),
+            'source_name': 'q - (slope*t + intercept)',
+            'provenance': 'generated data processor: custom_data_analysis',
+            'description': 'Residual after linear fit q(t) = slope*t + intercept'
         }
     ]
-
+    if fitted_extra:
+        derived.append({
+            'experiment_id': 'exp_01',
+            'name': 'q_quad_fit_residual',
+            'values': residuals_quad.tolist(),
+            'source_name': 'q - (a*t^2 + b*t + c)',
+            'provenance': 'generated data processor: custom_data_analysis',
+            'description': 'Residual after quadratic fit q(t) = a*t^2 + b*t + c'
+        })
+    
+    # --- 7. metrics -----------------------------------------------------------
     metrics = {
-        f"{exp_id}_q_mean": q_stats["mean"],
-        f"{exp_id}_q_std": q_stats["std"],
-        f"{exp_id}_q_min": q_stats["min"],
-        f"{exp_id}_q_max": q_stats["max"],
-        f"{exp_id}_v_mean": v_stats["mean"],
-        f"{exp_id}_v_std": v_stats["std"],
-        f"{exp_id}_v_min": v_stats["min"],
-        f"{exp_id}_v_max": v_stats["max"],
-        f"{exp_id}_a_mean": a_stats["mean"],
-        f"{exp_id}_a_std": a_stats["std"],
-        f"{exp_id}_a_min": a_stats["min"],
-        f"{exp_id}_a_max": a_stats["max"],
-        f"{exp_id}_v_rms": v_rms,
-        f"{exp_id}_a_rms": a_rms,
-        "dt": float(t[1] - t[0]),
-        "n_points": len(t)
+        'linear_slope': float(slope),
+        'linear_intercept': float(intercept),
+        'linear_R2': float(r2_linear),
+        'v_mean': v_mean,
+        'v_std': v_std,
+        'v_min': v_min,
+        'v_max': v_max,
+        'a_mean': a_mean,
+        'a_std': a_std,
+        'a_min': a_min,
+        'a_max': a_max
     }
-
-    figures = [fig_path]
-
+    metrics.update(fitted_extra)
+    
+    # --- 8. observation -------------------------------------------------------
+    obs_parts = [
+        f"对实验 exp_01 进行了 q(t) 的线性拟合：斜率={float(slope):.6f}，截距={float(intercept):.6f}，R²={float(r2_linear):.6f}。",
+        f"使用 Savitzky-Golay 滤波（window={window_length}, polyorder=2）估计速度和加速度。",
+        f"速度统计：均值={v_mean:.6f}，标准差={v_std:.6f}，范围=[{v_min:.6f}, {v_max:.6f}]。",
+        f"加速度统计：均值={a_mean:.6f}，标准差={a_std:.6f}，范围=[{a_min:.6f}, {a_max:.6f}]。"
+    ]
+    if fitted_extra:
+        a2_val = fitted_extra['quadratic_coeff_a']
+        b2_val = fitted_extra['quadratic_coeff_b']
+        c2_val = fitted_extra['quadratic_coeff_c']
+        obs_parts.append(
+            f"由于线性趋势非零或速度非零，进一步拟合了二次模型：q = {a2_val:.6f}*t^2 + {b2_val:.6f}*t + {c2_val:.6f}，R²={fitted_extra['quadratic_R2']:.6f}。"
+        )
+    else:
+        obs_parts.append("线性趋势和速度均值接近零，未进行进一步拟合。")
+    obs_parts.append("已生成 q-t 散点图（含线性拟合）、速度-t 图和加速度-t 图。")
+    observation = " ".join(obs_parts)
+    
     return {
-        "observation": observation,
-        "derived_series": derived_series,
-        "figures": figures,
-        "metrics": metrics
+        'observation': observation,
+        'derived_series': derived,
+        'figures': fig_paths,
+        'metrics': metrics
     }

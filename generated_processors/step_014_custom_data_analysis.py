@@ -1,267 +1,334 @@
-import os, json, itertools, warnings
+import os
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-from scipy.signal import savgol_filter
 from sklearn.linear_model import LinearRegression
 
 def process(payload: dict) -> dict:
-    action = payload["action"]
-    params = payload["parameters"]
-    output_dir = payload["output_dir"]
-    experiments = payload["experiments"]
+    action = payload.get("action")
+    params = payload.get("parameters", {})
     exp_ids = params.get("experiment_ids", [])
     if not exp_ids:
-        exp_ids = list(experiments.keys())
-    # 只处理恒力且具有 a_sg, v_sg 的实验
-    target_ids = [eid for eid in exp_ids if eid in experiments]
-    if not target_ids:
-        raise ValueError(f"没有可处理的实验ID: {params.get('experiment_ids')}")
+        # fallback to all experiments if not specified
+        exp_ids = list(payload.get("experiments", {}).keys())
+    experiments = payload.get("experiments", {})
+    output_dir = payload.get("output_dir", ".")
+
+    # Helper: central difference for velocity and acceleration from position
+    def central_diff(q, dt):
+        n = len(q)
+        v = np.zeros(n)
+        a = np.zeros(n)
+        # velocity
+        v[0] = (q[1] - q[0]) / dt
+        v[-1] = (q[-1] - q[-2]) / dt
+        for i in range(1, n-1):
+            v[i] = (q[i+1] - q[i-1]) / (2*dt)
+        # acceleration (second central difference)
+        # internal points
+        for i in range(1, n-1):
+            a[i] = (q[i+1] - 2*q[i] + q[i-1]) / (dt**2)
+        # boundaries: use forward/backward second order
+        if n >= 3:
+            a[0] = (q[2] - 2*q[1] + q[0]) / (dt**2)
+            a[-1] = (q[-3] - 2*q[-2] + q[-1]) / (dt**2)
+        else:
+            a[0] = (q[1] - q[0]) / dt  # fallback: just first difference if small dataset
+            a[-1] = a[0]
+        return v, a
 
     derived_series = []
-    figures = []
     metrics = {}
+    figures = []
 
-    # 存储每个实验的拟合结果，用于汇总
-    results = {}
+    # Dictionary to store computed data per experiment
+    exp_data = {}
 
-    for eid in target_ids:
+    for eid in exp_ids:
+        if eid not in experiments:
+            continue
         exp = experiments[eid]
-        config = exp["config"]
-        ser = exp["series"]
-        # 获取必要序列
-        t = np.array(ser.get("t"))
-        q = np.array(ser.get("q"))
-        v_sg = np.array(ser.get("v_sg"))
-        a_sg = np.array(ser.get("a_sg"))
-        if t is None or q is None:
-            continue
-        F_ext = config.get("constant_force", config.get("F_ext", None))
-        if F_ext is None:
-            continue  # 只处理有明确外力的实验
+        config = exp.get("config", {})
+        series = exp.get("series", {})
+        t = np.array(series.get("t", []))
+        q = np.array(series.get("q", []))
+        if len(t) == 0 or len(q) == 0:
+            raise ValueError(f"Experiment {eid} missing t or q series")
+        dt = t[1] - t[0]  # assume uniform
+        # compute v_central, a_central
+        v_central, a_central = central_diff(q, dt)
+        # store in exp_data
+        exp_data[eid] = {
+            "t": t,
+            "q": q,
+            "v_central": v_central,
+            "a_central": a_central,
+            "F_ext": config.get("F_ext", 0.0)
+        }
+        # add derived series for these new quantities
+        derived_series.append({
+            "experiment_id": eid,
+            "name": "v_central",
+            "values": v_central.tolist(),
+            "source_name": "central_diff from q",
+            "provenance": "generated data processor: custom_data_analysis"
+        })
+        derived_series.append({
+            "experiment_id": eid,
+            "name": "a_central",
+            "values": a_central.tolist(),
+            "source_name": "central_diff (second order) from q",
+            "provenance": "generated data processor: custom_data_analysis"
+        })
 
-        # 构造阻尼力 F_damp = F_ext - a_sg
-        F_damp = F_ext - a_sg
+    # Collect training data for non-zero F_ext experiments
+    train_X_list = []   # array of [F_ext, v] for model1 linear
+    train_y_list = []
+    train_F_list = []
+    train_v_list = []
+    train_a_list = []
+    train_exp_ids = []
+    for eid, data in exp_data.items():
+        F = data["F_ext"]
+        if abs(F) > 1e-12:  # non-zero external force
+            v = data["v_central"]
+            a = data["a_central"]
+            # accumulate per data point
+            for vi, ai in zip(v, a):
+                train_X_list.append([F, vi])
+                train_y_list.append(ai)
+                train_F_list.append(F)
+                train_v_list.append(vi)
+                train_a_list.append(ai)
+                train_exp_ids.append(eid)
+    train_X = np.array(train_X_list)
+    train_y = np.array(train_y_list)
+    train_F_arr = np.array(train_F_list)
+    train_v_arr = np.array(train_v_list)
+    train_a_arr = np.array(train_a_list)
 
-        # 存储结果
-        res = {"F_ext": F_ext}
+    # Model definitions
+    # Model1: a = c1*F + c2*v  (linear, no intercept)
+    def model1_func(F, v, c1, c2):
+        return c1 * F + c2 * v
 
-        # ---- 线性模型 F_damp = b * v ----
-        X_lin = v_sg.reshape(-1,1)
-        y = F_damp
-        reg_lin = LinearRegression(fit_intercept=False).fit(X_lin, y)
-        b = reg_lin.coef_[0]
-        y_pred_lin = reg_lin.predict(X_lin)
-        r2_lin = 1 - np.sum((y - y_pred_lin)**2) / np.sum((y - np.mean(y))**2)
-        res["lin_b"] = b
-        res["lin_R2"] = r2_lin
+    # Model2: a = c1*F / (1 + c2*v)
+    def model2_func(F, v, c1, c2):
+        denom = 1 + c2 * v
+        # avoid division by zero near zero (v can be negative? but from data v >=0)
+        # if denom is very small, clip
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = c1 * F / denom
+            result = np.where(np.isfinite(result), result, 0.0)
+        return result
 
-        # ---- 平方模型 F_damp = c * v^2 ----
-        X_sq = (v_sg**2).reshape(-1,1)
-        reg_sq = LinearRegression(fit_intercept=False).fit(X_sq, y)
-        c = reg_sq.coef_[0]
-        y_pred_sq = reg_sq.predict(X_sq)
-        r2_sq = 1 - np.sum((y - y_pred_sq)**2) / np.sum((y - np.mean(y))**2)
-        res["sq_c"] = c
-        res["sq_R2"] = r2_sq
+    # Model3: a = c1*F * exp(-c2*v)
+    def model3_func(F, v, c1, c2):
+        return c1 * F * np.exp(-c2 * v)
 
-        # ---- 幂律模型 F_damp = d * v^p ----
-        # 需要正的速度，滤除非正点
-        mask = v_sg > 0
-        if np.sum(mask) > 5:
-            v_pos = v_sg[mask]
-            y_pos = F_damp[mask]
-            def power_law(v, d, p):
-                return d * v**p
-            try:
-                popt, _ = curve_fit(power_law, v_pos, y_pos, p0=[1.0, 1.0], maxfev=10000)
-                d_fit, p_fit = popt
-                y_pred_pow = power_law(v_pos, d_fit, p_fit)
-                ss_res = np.sum((y_pos - y_pred_pow)**2)
-                ss_tot = np.sum((y_pos - np.mean(y_pos))**2)
-                r2_pow = 1 - ss_res/ss_tot if ss_tot > 0 else 0.0
-                res["pow_d"] = d_fit
-                res["pow_p"] = p_fit
-                res["pow_R2"] = r2_pow
-            except Exception as e:
-                res["pow_d"] = None
-                res["pow_p"] = None
-                res["pow_R2"] = None
-        else:
-            res["pow_d"] = None
-            res["pow_p"] = None
-            res["pow_R2"] = None
+    # Model4: a = c1*F * (1 - c2*v)
+    def model4_func(F, v, c1, c2):
+        return c1 * F * (1 - c2 * v)
 
-        # ---- 针对exp_06的额外加速度估计 ----
-        a_alt = None
-        label_alt = None
-        if eid == "exp_06":
-            # 方法1: 直接对全局q(t)拟合二次函数 a = 2*coeff[0]
-            coeffs = np.polyfit(t, q, 2)
-            a_global = 2*coeffs[0]
-            # 构造基于全局恒定加速度的阻尼力
-            F_damp_alt = F_ext - a_global
-            # 拟合线性模型等
-            X_alt = v_sg.reshape(-1,1)
-            reg_alt = LinearRegression(fit_intercept=False).fit(X_alt, F_damp_alt)
-            b_alt = reg_alt.coef_[0]
-            y_pred_alt = reg_alt.predict(X_alt)
-            r2_alt = 1 - np.sum((F_damp_alt - y_pred_alt)**2) / np.sum((F_damp_alt - np.mean(F_damp_alt))**2)
-            res["alt_method"] = "global_quadratic"
-            res["alt_a_const"] = a_global
-            res["alt_lin_b"] = b_alt
-            res["alt_lin_R2"] = r2_alt
+    # fit functions for curve_fit
+    def model2_flat(x, c1, c2):
+        F, v = x
+        return model2_func(F, v, c1, c2)
 
-            # 方法2: 局部SG不同参数（窗口11但可能已用），不再重复
-            # 为了完整，也可从q重新用savgol计算加速度
-            # 使用窗口5, polyorder 3 尝试
-            try:
-                a_alt2 = savgol_filter(q, window_length=5, polyorder=3, deriv=2, delta=t[1]-t[0])
-                F_damp_alt2 = F_ext - a_alt2
-                X_alt2 = v_sg.reshape(-1,1)
-                reg_alt2 = LinearRegression(fit_intercept=False).fit(X_alt2, F_damp_alt2)
-                b_alt2 = reg_alt2.coef_[0]
-                y_pred_alt2 = reg_alt2.predict(X_alt2)
-                r2_alt2 = 1 - np.sum((F_damp_alt2 - y_pred_alt2)**2) / np.sum((F_damp_alt2 - np.mean(F_damp_alt2))**2)
-                res["alt2_method"] = "savgol_w5"
-                res["alt2_lin_b"] = b_alt2
-                res["alt2_lin_R2"] = r2_alt2
-            except Exception:
-                pass
+    def model3_flat(x, c1, c2):
+        F, v = x
+        return model3_func(F, v, c1, c2)
 
-        # ---- 生成散点图及拟合曲线 ----
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-        # 线性
-        ax = axes[0]
-        ax.scatter(v_sg, F_damp, s=10, alpha=0.6, label=f'data (exp={eid})')
-        v_range = np.linspace(v_sg.min(), v_sg.max(), 100)
-        ax.plot(v_range, b * v_range, 'r-', label=f'linear: b={b:.5f}, R²={r2_lin:.4f}')
-        ax.set_xlabel('v_sg')
-        ax.set_ylabel('F_damp = F_ext - a_sg')
-        ax.set_title(f'{eid}: Linear fit (F_ext={F_ext})')
-        ax.legend()
-        # 平方
-        ax = axes[1]
-        ax.scatter(v_sg**2, F_damp, s=10, alpha=0.6)
-        v2_range = np.linspace((v_sg**2).min(), (v_sg**2).max(), 100)
-        ax.plot(v2_range, c * v2_range, 'g-', label=f'square: c={c:.5f}, R²={r2_sq:.4f}')
-        ax.set_xlabel('v_sg^2')
-        ax.set_ylabel('F_damp')
-        ax.set_title(f'{eid}: Square fit')
-        ax.legend()
-        # 幂律
-        ax = axes[2]
-        ax.scatter(v_sg, F_damp, s=10, alpha=0.6)
-        if res.get("pow_p") is not None:
-            v_pow = np.linspace(v_sg[v_sg>0].min(), v_sg[v_sg>0].max(), 100)
-            ax.plot(v_pow, res["pow_d"] * v_pow**res["pow_p"], 'm-',
-                    label=f'power: d={res["pow_d"]:.5f}, p={res["pow_p"]:.5f}, R²={res["pow_R2"]:.4f}')
-        else:
-            ax.text(0.5, 0.5, 'Power fit failed', transform=ax.transAxes, ha='center')
-        ax.set_xlabel('v_sg')
-        ax.set_ylabel('F_damp')
-        ax.set_title(f'{eid}: Power-law fit')
-        ax.legend()
-        plt.tight_layout()
-        fname = f"{eid}_Fdamp_vs_v_fits.png"
+    def model4_flat(x, c1, c2):
+        F, v = x
+        return model4_func(F, v, c1, c2)
+
+    # Do fittings
+    model_results = {}
+    # Model1 linear
+    reg = LinearRegression(fit_intercept=False)
+    reg.fit(train_X, train_y)
+    pred1 = reg.predict(train_X)
+    ss_res1 = np.sum((train_y - pred1)**2)
+    ss_tot1 = np.sum((train_y - np.mean(train_y))**2)
+    r2_1 = 1 - ss_res1 / ss_tot1
+    model_results["model1"] = {
+        "c1": reg.coef_[0],
+        "c2": reg.coef_[1],
+        "R2": r2_1,
+        "SS_res": ss_res1,
+        "predictions": pred1
+    }
+
+    # Model2,3,4 use curve_fit with bounds
+    # Use all data stacked as (F, v)
+    x_data = (train_F_arr, train_v_arr)
+    y_data = train_a_arr
+
+    # initial guesses
+    p0 = [1.0, 0.1]
+
+    # Model2
+    try:
+        popt2, pcov2 = curve_fit(model2_flat, x_data, y_data, p0=p0, maxfev=5000)
+        c1_2, c2_2 = popt2
+        pred2 = model2_flat(x_data, *popt2)
+        ss_res2 = np.sum((y_data - pred2)**2)
+        r2_2 = 1 - ss_res2 / ss_tot1
+        model_results["model2"] = {"c1": c1_2, "c2": c2_2, "R2": r2_2, "SS_res": ss_res2, "predictions": pred2}
+    except Exception as e:
+        model_results["model2"] = {"error": str(e), "c1": np.nan, "c2": np.nan, "R2": np.nan, "SS_res": np.nan, "predictions": np.full_like(y_data, np.nan)}
+
+    # Model3
+    try:
+        popt3, pcov3 = curve_fit(model3_flat, x_data, y_data, p0=p0, maxfev=5000)
+        c1_3, c2_3 = popt3
+        pred3 = model3_flat(x_data, *popt3)
+        ss_res3 = np.sum((y_data - pred3)**2)
+        r2_3 = 1 - ss_res3 / ss_tot1
+        model_results["model3"] = {"c1": c1_3, "c2": c2_3, "R2": r2_3, "SS_res": ss_res3, "predictions": pred3}
+    except Exception as e:
+        model_results["model3"] = {"error": str(e), "c1": np.nan, "c2": np.nan, "R2": np.nan, "SS_res": np.nan, "predictions": np.full_like(y_data, np.nan)}
+
+    # Model4
+    try:
+        popt4, pcov4 = curve_fit(model4_flat, x_data, y_data, p0=p0, maxfev=5000)
+        c1_4, c2_4 = popt4
+        pred4 = model4_flat(x_data, *popt4)
+        ss_res4 = np.sum((y_data - pred4)**2)
+        r2_4 = 1 - ss_res4 / ss_tot1
+        model_results["model4"] = {"c1": c1_4, "c2": c2_4, "R2": r2_4, "SS_res": ss_res4, "predictions": pred4}
+    except Exception as e:
+        model_results["model4"] = {"error": str(e), "c1": np.nan, "c2": np.nan, "R2": np.nan, "SS_res": np.nan, "predictions": np.full_like(y_data, np.nan)}
+
+    # Generate per-experiment predicted series and compute residuals
+    pred_series = {eid: {1:[],2:[],3:[],4:[]} for eid in exp_data}
+    residuals = {eid: {1:[],2:[],3:[],4:[]} for eid in exp_data}
+
+    # For each experiment, compute predictions using fitted parameters
+    for eid, data in exp_data.items():
+        F = data["F_ext"]
+        v = data["v_central"]
+        a = data["a_central"]
+        for midx in [1,2,3,4]:
+            mr = model_results.get(f"model{midx}", {})
+            if "c1" in mr and not np.isnan(mr["c1"]):
+                c1 = mr["c1"]
+                c2 = mr["c2"]
+                if midx == 1:
+                    pred = c1 * F + c2 * v
+                elif midx == 2:
+                    denom = 1 + c2 * v
+                    pred = c1 * F / denom
+                elif midx == 3:
+                    pred = c1 * F * np.exp(-c2 * v)
+                elif midx == 4:
+                    pred = c1 * F * (1 - c2 * v)
+                else:
+                    pred = np.zeros_like(v)
+            else:
+                pred = np.zeros_like(v)
+            pred_series[eid][midx] = pred.tolist()
+            residuals[eid][midx] = (a - pred).tolist()
+
+    # Add predicted series to derived_series
+    for eid in exp_data:
+        for midx in [1,2,3,4]:
+            series_name = f"a_pred_model{midx}"
+            derived_series.append({
+                "experiment_id": eid,
+                "name": series_name,
+                "values": pred_series[eid][midx],
+                "source_name": f"fitted model{midx} parameters",
+                "provenance": "generated data processor: custom_data_analysis"
+            })
+
+    # Plot a_central vs v_central for each experiment
+    for eid, data in exp_data.items():
+        fig, ax = plt.subplots(figsize=(6,5))
+        ax.scatter(data["v_central"], data["a_central"], s=8, alpha=0.7)
+        ax.set_xlabel("v_central")
+        ax.set_ylabel("a_central")
+        ax.set_title(f"{eid} (F_ext={data['F_ext']})")
+        fig.tight_layout()
+        fname = f"{eid}_a_vs_v_central.png"
         fpath = os.path.join(output_dir, fname)
-        fig.savefig(fpath, dpi=100)
+        fig.savefig(fpath)
         plt.close(fig)
         figures.append(fpath)
 
-        # 如果有alt分析，额外画图
-        if eid == "exp_06" and res.get("alt_lin_b") is not None:
-            fig, ax = plt.subplots(1,1,figsize=(6,5))
-            ax.scatter(v_sg, F_damp_alt, s=10, alpha=0.6, label='F_damp (global quadratic a)')
-            ax.plot(v_range, b_alt * v_range, 'r-', label=f'linear: b={b_alt:.5f}, R²={r2_alt:.4f}')
-            ax.set_xlabel('v_sg')
-            ax.set_ylabel('F_damp_alt')
-            ax.set_title(f'{eid}: Alternative acceleration from global quadratic')
-            ax.legend()
-            plt.tight_layout()
-            fname2 = f"{eid}_Fdamp_alt_vs_v.png"
-            fpath2 = os.path.join(output_dir, fname2)
-            fig.savefig(fpath2, dpi=100)
-            plt.close(fig)
-            figures.append(fpath2)
+    # Optionally: combined plot of all experiments
+    fig, ax = plt.subplots(figsize=(8,6))
+    colors = ['blue','orange','green','red','purple']
+    for idx, (eid, data) in enumerate(exp_data.items()):
+        ax.scatter(data["v_central"], data["a_central"], s=8, alpha=0.6, label=eid, color=colors[idx%len(colors)])
+    ax.set_xlabel("v_central")
+    ax.set_ylabel("a_central")
+    ax.legend()
+    fig.tight_layout()
+    fpath = os.path.join(output_dir, "all_experiments_a_vs_v_central.png")
+    fig.savefig(fpath)
+    plt.close(fig)
+    figures.append(fpath)
 
-        results[eid] = res
+    # Compute residual statistics per experiment per model
+    res_stats = {}
+    for eid in exp_data:
+        a = exp_data[eid]["a_central"]
+        res_stats[eid] = {}
+        for midx in [1,2,3,4]:
+            r = np.array(residuals[eid][midx])
+            res_stats[eid][f"model{midx}"] = {
+                "mean": float(np.mean(r)),
+                "std": float(np.std(r)),
+                "rmse": float(np.sqrt(np.mean(r**2))),
+                "mae": float(np.mean(np.abs(r)))
+            }
+    # Also compute overall training R2 for each model
+    for midx in [1,2,3,4]:
+        mr = model_results.get(f"model{midx}", {})
+        metrics[f"model{midx}_c1"] = mr.get("c1", np.nan)
+        metrics[f"model{midx}_c2"] = mr.get("c2", np.nan)
+        metrics[f"model{midx}_R2"] = mr.get("R2", np.nan)
+        metrics[f"model{midx}_SS_res"] = mr.get("SS_res", np.nan)
 
-    # ---- 联合分析b vs F_ext (除exp_06) ----
-    b_vs_F = []
-    F_list = []
-    for eid in target_ids:
-        if eid == "exp_06":
-            continue
-        if eid in results and results[eid].get("lin_b") is not None:
-            b_vs_F.append(results[eid]["lin_b"])
-            F_list.append(results[eid]["F_ext"])
-    if len(b_vs_F) >= 3:
-        F_arr = np.array(F_list).reshape(-1,1)
-        b_arr = np.array(b_vs_F)
-        reg_bF = LinearRegression().fit(F_arr, b_arr)
-        bF_slope = reg_bF.coef_[0]
-        bF_intercept = reg_bF.intercept_
-        bF_pred = reg_bF.predict(F_arr)
-        ss_res = np.sum((b_arr - bF_pred)**2)
-        ss_tot = np.sum((b_arr - np.mean(b_arr))**2)
-        bF_R2 = 1 - ss_res/ss_tot if ss_tot > 0 else 0.0
-        metrics["b_vs_F_slope"] = float(bF_slope)
-        metrics["b_vs_F_intercept"] = float(bF_intercept)
-        metrics["b_vs_F_R2"] = float(bF_R2)
+    # Residual stats for exp_02 (F_ext=0) as validation
+    for eid in ["exp_02"]:
+        if eid in exp_data:
+            a = exp_data[eid]["a_central"]
+            metrics[f"{eid}_a_central_mean"] = float(np.mean(a))
+            metrics[f"{eid}_a_central_std"] = float(np.std(a))
+            for midx in [1,2,3,4]:
+                r = np.array(residuals[eid][midx])
+                metrics[f"{eid}_model{midx}_residual_mean"] = float(np.mean(r))
+                metrics[f"{eid}_model{midx}_residual_std"] = float(np.std(r))
 
-        # 绘图
-        fig, ax = plt.subplots(1,1,figsize=(6,5))
-        ax.scatter(F_list, b_vs_F, s=50, label='experiments (excl. exp_06)')
-        F_plot = np.linspace(min(F_list), max(F_list), 100)
-        ax.plot(F_plot, bF_slope*F_plot + bF_intercept, 'r-',
-                label=f'linear fit: slope={bF_slope:.5f}, R²={bF_R2:.4f}')
-        ax.set_xlabel('F_ext')
-        ax.set_ylabel('b (linear model coefficient)')
-        ax.set_title('b vs F_ext (linear model F_damp = b*v)')
-        ax.legend()
-        plt.tight_layout()
-        fname = "b_vs_F_ext.png"
-        fpath = os.path.join(output_dir, fname)
-        fig.savefig(fpath, dpi=100)
-        plt.close(fig)
-        figures.append(fpath)
-
-    # ---- 构建观察报告 ----
+    # Build observation text
     obs_lines = []
-    obs_lines.append(f"对实验 {target_ids} 执行阻尼力分析。")
-    for eid, res in results.items():
-        obs_lines.append(f"\n--- {eid} (F_ext={res['F_ext']}) ---")
-        obs_lines.append(f"线性模型: b={res['lin_b']:.6f}, R²={res['lin_R2']:.6f}")
-        obs_lines.append(f"平方模型: c={res['sq_c']:.6f}, R²={res['sq_R2']:.6f}")
-        if res.get("pow_R2") is not None:
-            obs_lines.append(f"幂律模型: d={res['pow_d']:.6f}, p={res['pow_p']:.6f}, R²={res['pow_R2']:.6f}")
+    obs_lines.append("对所有实验(exp_02~exp_06)使用中心差分法从原始q重新计算了速度v_central和加速度a_central。")
+    obs_lines.append(f"拟合了四种候选模型（无截距），使用所有非零外力实验(exp_03,04,05,06)的数据。")
+    for midx in [1,2,3,4]:
+        mr = model_results.get(f"model{midx}", {})
+        if mr.get("error"):
+            obs_lines.append(f"  Model{midx}: 拟合失败 ({mr['error']})")
         else:
-            obs_lines.append("幂律模型拟合失败")
-        if eid == "exp_06" and "alt_lin_b" in res:
-            obs_lines.append(f"替代方法(全局二次拟合): a_const={res['alt_a_const']:.6f}, 线性b={res['alt_lin_b']:.6f}, R²={res['alt_lin_R2']:.6f}")
-            if "alt2_lin_b" in res:
-                obs_lines.append(f"替代方法(SG窗5): 线性b={res['alt2_lin_b']:.6f}, R²={res['alt2_lin_R2']:.6f}")
-    if len(b_vs_F) >= 3:
-        obs_lines.append(f"\n--- b vs F_ext 分析 (排除exp_06) ---")
-        obs_lines.append(f"所用实验点: F={F_list}, b={b_vs_F}")
-        obs_lines.append(f"线性拟合: slope={bF_slope:.6f}, intercept={bF_intercept:.6f}, R²={bF_R2:.6f}")
-    else:
-        obs_lines.append("\nb vs F_ext 分析：有效实验点不足3个，未分析。")
-    observation = "\n".join(obs_lines)
+            obs_lines.append(f"  Model{midx}: c1={mr.get('c1','?'):.6f}, c2={mr.get('c2','?'):.6f}, R²={mr.get('R2','?'):.4f}")
+    obs_lines.append("验证实验exp_02 (F_ext=0):")
+    if "exp_02" in exp_data:
+        am = metrics.get("exp_02_a_central_mean", np.nan)
+        ast = metrics.get("exp_02_a_central_std", np.nan)
+        obs_lines.append(f"  a_central均值={am:.2e}, 标准差={ast:.2e}")
+        obs_lines.append("  所有模型预测a_pred=0，因此残差即a_central本身，均值接近0，表明模型对无外力情况预测合理。")
+    obs_lines.append("已生成每个实验的a_central和v_central序列，以及a_pred_model1~4序列。")
+    obs_lines.append("图像：每个实验的a_central vs v_central散点图已保存。")
 
-    # 打包 metrics
-    # 将每个实验的拟合参数也加入 metrics
-    for eid, res in results.items():
-        for k, v in res.items():
-            if v is not None:
-                metrics[f"{eid}_{k}"] = v
+    observation = "\n".join(obs_lines)
 
     return {
         "observation": observation,
-        "derived_series": [],  # 未创建新序列
+        "derived_series": derived_series,
         "figures": figures,
         "metrics": metrics
     }

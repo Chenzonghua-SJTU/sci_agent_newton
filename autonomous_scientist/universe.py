@@ -25,7 +25,7 @@ class ExperimentConfig:
         force_field_type: 势场/受力场类型。
         t_span: 时间区间，格式为 (t_start, t_end)。
         dt: 采样时间间隔。
-        noise_std: 观测噪声标准差，仅加在位置 q 上。
+        noise_std: 观测噪声标准差。当前实验环境全局固定为 0。
         constant_force: 当场景为恒定外力时使用的常力大小。
     """
 
@@ -36,6 +36,9 @@ class ExperimentConfig:
     dt: float
     noise_std: float = 0.0
     constant_force: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.noise_std = 0.0
 
 
 @dataclass(slots=True)
@@ -58,26 +61,8 @@ class ExperimentResult:
 class VirtualUniverse:
     """黑盒虚拟物理宇宙。
 
-    这个宇宙的真实动力学不是经典牛顿第二定律，而是一个
-    “速度相关惯性”模型：
-
-        F(q) = (m0 + alpha * v^2) * a
-
-    其中：
-        q: 位置
-        v: 速度
-        a: 加速度 = dv/dt
-        m0: 低速极限下的基础惯性
-        alpha: 控制速度相关惯性的强度
-        F(q): 外力，等于 -V'(q)
-
-    对应到一阶常微分方程组可以写为：
-
-        dq/dt = v
-        dv/dt = F(q) / (m0 + alpha * v^2)
-
-    这样既保留了“惯性随速度变化”的反常识结构，又避免了旧版
-    v -> 0 时有效惯性趋近 0、加速度发散的奇点问题。
+    Agent 只能通过 run_experiment 返回的 t,q 观测和控制参数探索该世界。
+    这里的内部积分细节不应出现在任何发给决策 LLM 或数据处理 LLM 的上下文中。
     """
 
     def __init__(
@@ -135,6 +120,7 @@ class VirtualUniverse:
         q = solution.y[0].copy()
         v = solution.y[1].copy()
 
+        config.noise_std = 0.0
         if config.noise_std > 0:
             q += self._rng.normal(loc=0.0, scale=config.noise_std, size=q.shape)
 
@@ -193,8 +179,6 @@ class VirtualUniverse:
         q, v = float(state[0]), float(state[1])
         force = force_fn(q)
 
-        # 速度相关惯性：低速时惯性约为 base_mass，高速时惯性增大。
-        # 因为分母始终 >= base_mass，所以 v=0 时不会出现加速度奇点。
         effective_inertia = self.base_mass + self.alpha * v * v
 
         dq_dt = v

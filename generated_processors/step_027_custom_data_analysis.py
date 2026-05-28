@@ -1,303 +1,257 @@
-import os
 import json
+import math
+import statistics
+import itertools
+import functools
+import collections
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
+import scipy
+from scipy import signal, optimize, stats
+import sklearn
+from sklearn.metrics import r2_score
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from numpy.polynomial import polynomial as P
 
 def process(payload: dict) -> dict:
-    action = payload.get("action", "")
+    action = payload.get("action", "custom_data_analysis")
     params = payload.get("parameters", {})
-    experiment_ids = params.get("experiment_ids", [])
-    analysis_goal = params.get("analysis_goal", "")
     experiments = payload.get("experiments", {})
-    output_dir = payload.get("output_dir", ".")
+    output_dir = Path(payload.get("output_dir", "."))
 
-    # 只处理指定的实验
+    experiment_ids = params.get("experiment_ids", list(experiments.keys()))
     if not experiment_ids:
         experiment_ids = list(experiments.keys())
 
-    # 收集每个实验的数据
-    plot_data = []   # 用于绘图：每个元素是 (v_sg, drag, label, color)
-    metrics = {}
-    derived_series_list = []
-    figures = []
-
-    # 颜色映射
-    color_map = {'exp_02': 'blue', 'exp_03': 'green', 'exp_04': 'orange', 'exp_05': 'red'}
-
-    # 存储每个实验的拟合结果用于合并拟合（如果需要）
+    # Collect all normalized data for global fit
     all_v = []
-    all_drag = []
-    exp_labels = []
+    all_y = []  # a / F_ext
+    all_exp_ids = []
+    derived_series_list = []
+    fit_data = {}   # per experiment data for later residual calculation
 
     for eid in experiment_ids:
         if eid not in experiments:
-            raise ValueError(f"Experiment {eid} not found in payload.")
+            continue
         exp = experiments[eid]
         config = exp.get("config", {})
         series = exp.get("series", {})
-        available = exp.get("available_series", [])
-
-        # 确保 a_sg, v_sg 存在
-        if "a_sg" not in series or "v_sg" not in series:
-            raise ValueError(f"Experiment {eid} missing a_sg or v_sg series.")
-        a_sg = np.array(series["a_sg"])
-        v_sg = np.array(series["v_sg"])
-        t = np.array(series["t"])
-
-        # 读取外力 F_ext
-        force_field_type = config.get("force_field_type", "")
-        if force_field_type == "free":
-            F_ext = 0.0
-        else:
-            F_ext = config.get("constant_force", None)
-            if F_ext is None:
-                raise ValueError(f"Experiment {eid}: constant_force not found in config.")
-            F_ext = float(F_ext)
-
-        # 计算 drag = F_ext - a_sg
-        drag = F_ext - a_sg
-
-        # 返回 drag 序列（覆盖已有）
-        derived_series_list.append({
-            "experiment_id": eid,
-            "name": "drag",
-            "values": drag.tolist(),
-            "source_name": f"drag = {F_ext} - a_sg",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"Drag force calculated as F_ext - a_sg for experiment {eid}"
-        })
-
-        # 收集数据用于合并拟合
-        all_v.extend(v_sg.tolist())
-        all_drag.extend(drag.tolist())
-        exp_labels.extend([eid]*len(v_sg))
-
-        # 拟合：线性模型 drag = c0 + c1*v_sg
-        coeffs_linear = np.polyfit(v_sg, drag, 1)   # coeffs: [c1, c0]
-        c1_lin, c0_lin = coeffs_linear[0], coeffs_linear[1]
-        pred_linear = np.polyval(coeffs_linear, v_sg)
-        resid_linear = drag - pred_linear
-        ss_res_linear = np.sum(resid_linear**2)
-        ss_tot_linear = np.sum((drag - np.mean(drag))**2)
-        r2_linear = 1 - ss_res_linear / ss_tot_linear if ss_tot_linear > 0 else 0.0
-        resid_std_linear = np.std(resid_linear, ddof=2)  # 有2个参数
-
-        # 返回线性残差序列
-        derived_series_list.append({
-            "experiment_id": eid,
-            "name": "linear_residual",
-            "values": resid_linear.tolist(),
-            "source_name": f"drag - (c0 + c1*v_sg) from linear fit",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"Residual of linear drag vs v_sg fit for {eid}"
-        })
-
-        # 二次模型 drag = c0 + c1*v_sg + c2*v_sg^2
-        coeffs_quad = np.polyfit(v_sg, drag, 2)   # [c2, c1, c0]
-        c2_q, c1_q, c0_q = coeffs_quad[0], coeffs_quad[1], coeffs_quad[2]
-        pred_quad = np.polyval(coeffs_quad, v_sg)
-        resid_quad = drag - pred_quad
-        ss_res_quad = np.sum(resid_quad**2)
-        ss_tot_quad = np.sum((drag - np.mean(drag))**2)
-        r2_quad = 1 - ss_res_quad / ss_tot_quad if ss_tot_quad > 0 else 0.0
-        resid_std_quad = np.std(resid_quad, ddof=3)  # 3个参数
-
-        # 返回二次残差序列
-        derived_series_list.append({
-            "experiment_id": eid,
-            "name": "quad_residual",
-            "values": resid_quad.tolist(),
-            "source_name": f"drag - (c0 + c1*v_sg + c2*v_sg^2) from quadratic fit",
-            "provenance": "generated data processor: custom_data_analysis",
-            "description": f"Residual of quadratic drag vs v_sg fit for {eid}"
-        })
-
-        # 检查 drag/v_sg 是否近似常数
-        v_sg_safe = np.where(np.abs(v_sg) < 1e-12, np.nan, v_sg)  # 避免除零
-        drag_over_v = drag / v_sg_safe
-        valid_mask = ~np.isnan(drag_over_v)
-        if np.sum(valid_mask) > 0:
-            mean_dov = np.mean(drag_over_v[valid_mask])
-            std_dov = np.std(drag_over_v[valid_mask])
-            dov_note = f"drag/v_sg: mean={mean_dov:.4f}, std={std_dov:.4f}"
-        else:
-            mean_dov = np.nan
-            std_dov = np.nan
-            dov_note = "drag/v_sg: all v_sg near zero, cannot compute"
-
-        # 检查 drag 与 v_sg^2 的线性关系
-        v2 = v_sg**2
-        coeffs_v2 = np.polyfit(v2, drag, 1)   # drag = k*v^2 + c
-        k_v2, c_v2 = coeffs_v2[0], coeffs_v2[1]
-        pred_v2 = np.polyval(coeffs_v2, v2)
-        resid_v2 = drag - pred_v2
-        ss_res_v2 = np.sum(resid_v2**2)
-        ss_tot_v2 = np.sum((drag - np.mean(drag))**2)
-        r2_v2 = 1 - ss_res_v2 / ss_tot_v2 if ss_tot_v2 > 0 else 0.0
-        resid_std_v2 = np.std(resid_v2, ddof=2)
-
-        # 记录指标
-        prefix = eid
-        metrics[f"{prefix}_linear_c0"] = c0_lin
-        metrics[f"{prefix}_linear_c1"] = c1_lin
-        metrics[f"{prefix}_linear_R2"] = r2_linear
-        metrics[f"{prefix}_linear_resid_std"] = resid_std_linear
-        metrics[f"{prefix}_quad_c0"] = c0_q
-        metrics[f"{prefix}_quad_c1"] = c1_q
-        metrics[f"{prefix}_quad_c2"] = c2_q
-        metrics[f"{prefix}_quad_R2"] = r2_quad
-        metrics[f"{prefix}_quad_resid_std"] = resid_std_quad
-        metrics[f"{prefix}_drag_over_v_mean"] = mean_dov
-        metrics[f"{prefix}_drag_over_v_std"] = std_dov
-        metrics[f"{prefix}_drag_vs_v2_k"] = k_v2
-        metrics[f"{prefix}_drag_vs_v2_c"] = c_v2
-        metrics[f"{prefix}_drag_vs_v2_R2"] = r2_v2
-        metrics[f"{prefix}_drag_vs_v2_resid_std"] = resid_std_v2
-
-        # 准备绘图数据
-        color = color_map.get(eid, 'gray')
-        plot_data.append((v_sg, drag, eid, color))
-
-        # 构建 observation 文本（每个实验的统计）
-        # 将在后面汇总
-
-    # 输出每个实验的统计（在observation中）
-    obs_lines = []
-    obs_lines.append("对实验 {} 计算 drag = F_ext - a_sg，并拟合 drag vs v_sg。".format(experiment_ids))
-    obs_lines.append("")
-    for eid in experiment_ids:
-        if eid not in metrics:
+        available = exp.get("available_series", list(series.keys()))
+        t = series.get("t")
+        if t is None:
             continue
-        prefix = eid
-        c0_lin = metrics[f"{prefix}_linear_c0"]
-        c1_lin = metrics[f"{prefix}_linear_c1"]
-        r2_lin = metrics[f"{prefix}_linear_R2"]
-        rs_lin = metrics[f"{prefix}_linear_resid_std"]
-        c0_q = metrics[f"{prefix}_quad_c0"]
-        c1_q = metrics[f"{prefix}_quad_c1"]
-        c2_q = metrics[f"{prefix}_quad_c2"]
-        r2_q = metrics[f"{prefix}_quad_R2"]
-        rs_q = metrics[f"{prefix}_quad_resid_std"]
-        dov_mean = metrics[f"{prefix}_drag_over_v_mean"]
-        dov_std = metrics[f"{prefix}_drag_over_v_std"]
-        k_v2 = metrics[f"{prefix}_drag_vs_v2_k"]
-        c_v2 = metrics[f"{prefix}_drag_vs_v2_c"]
-        r2_v2 = metrics[f"{prefix}_drag_vs_v2_R2"]
-        rs_v2 = metrics[f"{prefix}_drag_vs_v2_resid_std"]
-        obs_lines.append(f"实验 {eid}:")
-        obs_lines.append(f"  线性模型 drag = {c0_lin:.4f} + {c1_lin:.4f}*v_sg, R²={r2_lin:.4f}, 残差标准差={rs_lin:.4f}")
-        obs_lines.append(f"  二次模型 drag = {c0_q:.4f} + {c1_q:.4f}*v_sg + {c2_q:.4f}*v_sg², R²={r2_q:.4f}, 残差标准差={rs_q:.4f}")
-        obs_lines.append(f"  drag/v_sg: 均值={dov_mean:.4f}, 标准差={dov_std:.4f}")
-        obs_lines.append(f"  drag vs v_sg²线性拟合: drag = {c_v2:.4f} + {k_v2:.4f}*v_sg², R²={r2_v2:.4f}, 残差标准差={rs_v2:.4f}")
-        obs_lines.append("")
+        dt = config.get("dt", 0.1)
+        F_ext = config.get("F_ext", 0.0)
+        if F_ext == 0.0:
+            continue   # skip zero force experiments
 
-    # 合并所有实验的拟合（整体线性/二次）
-    if len(all_v) > 0:
-        all_v_arr = np.array(all_v)
-        all_drag_arr = np.array(all_drag)
-        # 全局线性
-        coeffs_global_lin = np.polyfit(all_v_arr, all_drag_arr, 1)
-        c1_gl, c0_gl = coeffs_global_lin[0], coeffs_global_lin[1]
-        pred_gl_lin = np.polyval(coeffs_global_lin, all_v_arr)
-        resid_gl_lin = all_drag_arr - pred_gl_lin
-        ss_res_gl_lin = np.sum(resid_gl_lin**2)
-        ss_tot_gl_lin = np.sum((all_drag_arr - np.mean(all_drag_arr))**2)
-        r2_gl_lin = 1 - ss_res_gl_lin / ss_tot_gl_lin if ss_tot_gl_lin > 0 else 0.0
-        resid_std_gl_lin = np.std(resid_gl_lin, ddof=2)
-        # 全局二次
-        coeffs_global_quad = np.polyfit(all_v_arr, all_drag_arr, 2)
-        c2_gl, c1_gl, c0_gl = coeffs_global_quad[0], coeffs_global_quad[1], coeffs_global_quad[2]
-        pred_gl_quad = np.polyval(coeffs_global_quad, all_v_arr)
-        resid_gl_quad = all_drag_arr - pred_gl_quad
-        ss_res_gl_quad = np.sum(resid_gl_quad**2)
-        ss_tot_gl_quad = np.sum((all_drag_arr - np.mean(all_drag_arr))**2)
-        r2_gl_quad = 1 - ss_res_gl_quad / ss_tot_gl_quad if ss_tot_gl_quad > 0 else 0.0
-        resid_std_gl_quad = np.std(resid_gl_quad, ddof=3)
-        obs_lines.append("合并所有数据点的全局拟合:")
-        obs_lines.append(f"  线性: drag={c0_gl:.4f}+{c1_gl:.4f}*v_sg, R²={r2_gl_lin:.4f}, 残差标准差={resid_std_gl_lin:.4f}")
-        obs_lines.append(f"  二次: drag={c0_gl:.4f}+{c1_gl:.4f}*v_sg+{c2_gl:.4f}*v_sg², R²={r2_gl_quad:.4f}, 残差标准差={resid_std_gl_quad:.4f}")
-        # 记录全局指标
-        metrics["global_linear_c0"] = c0_gl
-        metrics["global_linear_c1"] = c1_gl
-        metrics["global_linear_R2"] = r2_gl_lin
-        metrics["global_linear_resid_std"] = resid_std_gl_lin
-        metrics["global_quad_c0"] = c0_gl
-        metrics["global_quad_c1"] = c1_gl
-        metrics["global_quad_c2"] = c2_gl
-        metrics["global_quad_R2"] = r2_gl_quad
-        metrics["global_quad_resid_std"] = resid_std_gl_quad
+        # Ensure a_new and v_new exist, else generate from q
+        if "a_new" in series and "v_new" in series:
+            a_new = series["a_new"]
+            v_new = series["v_new"]
+            if len(a_new) != len(t) or len(v_new) != len(t):
+                # might be inconsistent, regenerate
+                v_new, a_new = _estimate_kinematics(series["q"], t, dt)
+                derived_series_list.append({
+                    "experiment_id": eid,
+                    "name": "v_new",
+                    "values": v_new.tolist(),
+                    "source_name": "Savgol filter from q",
+                    "provenance": "generated data processor: step_025_custom_data_analysis",
+                    "description": "Velocity estimated from q using Savgol filter (window=11, polyorder=3, deriv=1)"
+                })
+                derived_series_list.append({
+                    "experiment_id": eid,
+                    "name": "a_new",
+                    "values": a_new.tolist(),
+                    "source_name": "Savgol filter from q",
+                    "provenance": "generated data processor: step_025_custom_data_analysis",
+                    "description": "Acceleration estimated from q using Savgol filter (window=11, polyorder=3, deriv=2)"
+                })
+        else:
+            if "q" not in series:
+                continue
+            v_new, a_new = _estimate_kinematics(series["q"], t, dt)
+            derived_series_list.append({
+                "experiment_id": eid,
+                "name": "v_new",
+                "values": v_new.tolist(),
+                "source_name": "Savgol filter from q",
+                "provenance": "generated data processor: step_025_custom_data_analysis",
+                "description": "Velocity estimated from q using Savgol filter (window=11, polyorder=3, deriv=1)"
+            })
+            derived_series_list.append({
+                "experiment_id": eid,
+                "name": "a_new",
+                "values": a_new.tolist(),
+                "source_name": "Savgol filter from q",
+                "provenance": "generated data processor: step_025_custom_data_analysis",
+                "description": "Acceleration estimated from q using Savgol filter (window=11, polyorder=3, deriv=2)"
+            })
+
+        # Now we have a_new, v_new arrays
+        y = np.array(a_new, dtype=float) / F_ext
+        x = np.array(v_new, dtype=float)
+        # Remove any nan/inf
+        mask = np.isfinite(x) & np.isfinite(y)
+        x = x[mask]
+        y = y[mask]
+        if len(x) < 2:
+            continue
+        all_v.append(x)
+        all_y.append(y)
+        all_exp_ids.extend([eid] * len(x))
+        fit_data[eid] = {"x": x.copy(), "y": y.copy()}
+
+    if len(all_v) == 0:
+        return {
+            "observation": "没有有效恒外力实验数据用于全局拟合。",
+            "derived_series": derived_series_list,
+            "figures": [],
+            "metrics": {}
+        }
+
+    X = np.concatenate(all_v)
+    Y = np.concatenate(all_y)
+
+    # Global fit: y = exp(-b * x)
+    def model(x, b):
+        return np.exp(-b * x)
+
+    # Initial guess
+    # Use linear regression of log(y) vs x to get initial b: log(y) = -b*x
+    with np.errstate(divide='ignore', invalid='ignore'):
+        logY = np.where(Y > 0, np.log(Y), -1e10)
+    valid = np.isfinite(logY) & (logY > -1e9)
+    if valid.sum() < 2:
+        # fallback
+        b0 = 0.7
     else:
-        obs_lines.append("无有效数据用于全局拟合。")
+        slope, intercept, r_val, p_val, std_err = stats.linregress(X[valid], logY[valid])
+        b0 = -slope if slope > 0 else 0.7
 
-    # 绘图
-    fig, ax = plt.subplots(figsize=(10, 6))
-    # 为每个实验绘制散点
-    for v, d, label, color in plot_data:
-        ax.scatter(v, d, label=label, color=color, s=20, alpha=0.7)
-    # 绘制每个实验的拟合曲线（使用该实验的拟合系数）
-    # 为了图清晰，只绘制全局拟合曲线，或者每个实验的？决定绘制全局拟合曲线
-    v_grid = np.linspace(min(all_v), max(all_v), 300) if len(all_v) > 0 else np.array([])
-    if len(all_v) > 0:
-        # 全局线性
-        ax.plot(v_grid, np.polyval([c1_gl, c0_gl], v_grid), 'k--', label=f'Global linear (R²={r2_gl_lin:.3f})', linewidth=1)
-        # 全局二次
-        ax.plot(v_grid, np.polyval([c2_gl, c1_gl, c0_gl], v_grid), 'k-', label=f'Global quadratic (R²={r2_gl_quad:.3f})', linewidth=1)
-    ax.set_xlabel('v_sg')
-    ax.set_ylabel('drag')
-    ax.set_title('Drag vs v_sg for each experiment with global fits')
-    ax.legend()
-    fig_path = os.path.join(output_dir, "drag_vs_v_sg_scatter_with_fits.png")
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=150)
-    plt.close()
-    figures.append(fig_path)
+    try:
+        popt, pcov = optimize.curve_fit(model, X, Y, p0=[b0], bounds=(0, np.inf))
+        b_opt = popt[0]
+        b_stderr = np.sqrt(pcov[0,0]) if pcov[0,0] > 0 else None
+    except Exception as e:
+        # fallback to brute force search
+        b_candidates = np.linspace(0.01, 5, 500)
+        best_err = np.inf
+        b_opt = 0.7
+        for b_test in b_candidates:
+            err = np.mean((Y - model(X, b_test))**2)
+            if err < best_err:
+                best_err = err
+                b_opt = b_test
+        b_stderr = None
 
-    # 残差图：每个实验的线性残差和二次残差
-    fig2, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    for eid in experiment_ids:
-        if eid not in experiments:
-            continue
-        exp = experiments[eid]
-        series = exp.get("series", {})
-        if "linear_residual" in series:
-            resid_lin = np.array(series["linear_residual"])
+    Y_pred = model(X, b_opt)
+    R2 = r2_score(Y, Y_pred)
+
+    # Per-experiment residual statistics
+    residuals = Y - Y_pred
+    resid_stats = {}
+    exp_ids_arr = np.array(all_exp_ids)
+    for eid in np.unique(exp_ids_arr):
+        mask = exp_ids_arr == eid
+        resid = residuals[mask]
+        x_eid = X[mask]
+        resid_mean = np.mean(resid)
+        resid_std = np.std(resid, ddof=1)
+        resid_min = np.min(resid)
+        resid_max = np.max(resid)
+        # correlation with v
+        if len(x_eid) > 1:
+            corr = np.corrcoef(x_eid, resid)[0,1]
         else:
-            # 从返回的derived_series中取？但还没返回给payload，所以这里不能直接使用。我们直接使用本地计算的residual（local变量）
-            # 但是我们已经计算过，需要存储。简单起见，重新计算一遍
-            a_sg = np.array(series["a_sg"])
-            v_sg = np.array(series["v_sg"])
-            F_ext = float(config.get("constant_force", 0))
-            drag = F_ext - a_sg
-            coeffs_linear = np.polyfit(v_sg, drag, 1)
-            resid_lin = drag - np.polyval(coeffs_linear, v_sg)
-            coeffs_quad = np.polyfit(v_sg, drag, 2)
-            resid_quad = drag - np.polyval(coeffs_quad, v_sg)
-        color = color_map.get(eid, 'gray')
-        axes[0].scatter(v_sg, resid_lin, label=eid, color=color, s=10, alpha=0.7)
-        axes[1].scatter(v_sg, resid_quad, label=eid, color=color, s=10, alpha=0.7)
-    axes[0].axhline(0, color='gray', linestyle='--')
-    axes[1].axhline(0, color='gray', linestyle='--')
-    axes[0].set_ylabel('Linear residual')
-    axes[1].set_xlabel('v_sg')
-    axes[1].set_ylabel('Quadratic residual')
-    axes[0].legend()
-    axes[1].legend()
-    axes[0].set_title('Residuals of drag vs v_sg fits')
-    resid_path = os.path.join(output_dir, "drag_vs_v_sg_residuals.png")
-    plt.tight_layout()
-    plt.savefig(resid_path, dpi=150)
-    plt.close()
-    figures.append(resid_path)
+            corr = np.nan
+        resid_stats[eid] = {
+            "residual_mean": float(resid_mean),
+            "residual_std": float(resid_std),
+            "residual_min": float(resid_min),
+            "residual_max": float(resid_max),
+            "corr_v_residual": float(corr)
+        }
 
-    observation = "\n".join(obs_lines)
+    # Build metrics dict
+    metrics = {
+        "b_value": float(b_opt),
+        "b_stderr": float(b_stderr) if b_stderr is not None else None,
+        "global_R2": float(R2),
+        "global_RMSE": float(np.sqrt(np.mean(residuals**2)))
+    }
+    for eid, stats_e in resid_stats.items():
+        for k, v in stats_e.items():
+            metrics[f"{eid}_{k}"] = v
 
-    result = {
-        "observation": observation,
+    # Plot: a/F_ext vs v with global fit curve
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = plt.cm.tab10(np.linspace(0,1,10))
+    color_idx = 0
+    for eid in experiment_ids:
+        if eid not in fit_data:
+            continue
+        x_eid = fit_data[eid]["x"]
+        y_eid = fit_data[eid]["y"]
+        if len(x_eid) == 0:
+            continue
+        ax.scatter(x_eid, y_eid, s=5, color=colors[color_idx % len(colors)], label=f"{eid} (F_ext={experiments[eid]['config'].get('F_ext','?')})", alpha=0.6)
+        color_idx += 1
+    # global fit curve
+    x_plot = np.linspace(X.min(), X.max(), 300)
+    y_plot = model(x_plot, b_opt)
+    ax.plot(x_plot, y_plot, 'k-', linewidth=2, label=f'Global exp fit: b={b_opt:.4f}, R²={R2:.4f}')
+    ax.set_xlabel("v (velocity)")
+    ax.set_ylabel("a / F_ext")
+    ax.set_title("Global Exponential Fit: a/F_ext = exp(-b * v)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig_path = output_dir / "global_exp_fit_across_experiments.png"
+    fig.savefig(str(fig_path), dpi=300)
+    plt.close(fig)
+
+    # Build observation string
+    obs_lines = [
+        f"全局指数模型拟合完成，使用实验 {experiment_ids}。",
+        f"拟合参数 b = {b_opt:.4f} (标准误={b_stderr:.4f})，全局 R² = {R2:.4f}。",
+        f"全局 RMSE = {np.sqrt(np.mean(residuals**2)):.4f}。",
+        "各实验残差统计："
+    ]
+    for eid in experiment_ids:
+        if eid in resid_stats:
+            s = resid_stats[eid]
+            obs_lines.append(f"  {eid}: 均值 {s['residual_mean']:.5f}, 标准差 {s['residual_std']:.5f}, "
+                             f"范围 [{s['residual_min']:.5f},{s['residual_max']:.5f}], "
+                             f"与 v 相关系数 {s['corr_v_residual']:.4f}")
+    obs_lines.append(f"图像已保存: {fig_path.name}")
+
+    return {
+        "observation": "\n".join(obs_lines),
         "derived_series": derived_series_list,
-        "figures": figures,
+        "figures": [str(fig_path)],
         "metrics": metrics
     }
-    return result
+
+def _estimate_kinematics(q_raw: list, t_raw: list, dt: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Estimate velocity and acceleration from position using Savitzky-Golay filter.
+    Returns (v_new, a_new) as numpy arrays of same length as q.
+    """
+    from scipy.signal import savgol_filter
+    q = np.array(q_raw, dtype=float)
+    window_length = 11
+    polyorder = 3
+    # Ensure window length is odd and <= len(q)
+    if len(q) < window_length:
+        window_length = len(q) if len(q) % 2 == 1 else len(q) - 1
+        if window_length < 3:
+            window_length = 3
+    if window_length <= polyorder:
+        polyorder = window_length - 1
+    v = savgol_filter(q, window_length, polyorder, deriv=1, delta=dt)
+    a = savgol_filter(q, window_length, polyorder, deriv=2, delta=dt)
+    return v, a

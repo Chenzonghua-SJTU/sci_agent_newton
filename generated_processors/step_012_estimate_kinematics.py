@@ -1,130 +1,126 @@
-import os
 import numpy as np
 from scipy.signal import savgol_filter
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+from typing import Any, Dict, List, Tuple
+import os
 
-def process(payload: dict) -> dict:
+def process(payload: Dict[str, Any]) -> Dict[str, Any]:
+    action = payload["action"]
     params = payload["parameters"]
-    exp_id = params["experiment_id"]
-    source_series = params["source_series"]
-    pos_name = params["position_name"]
-    vel_name = params["velocity_name"]
-    acc_name = params["acceleration_name"]
-    window_length = params["window_length"]
-    polyorder = params["polyorder"]
+    experiments = payload["experiments"]
+    output_dir = payload["output_dir"]
+
+    # Validate parameters
+    experiment_ids = params.get("experiment_ids", [])
+    if not experiment_ids:
+        # Fallback: if no experiment_ids, use all
+        experiment_ids = list(experiments.keys())
+    source = params.get("source_series", "q")
+    pos_name = params.get("position_name", "q_smooth")
+    vel_name = params.get("velocity_name", "v")
+    acc_name = params.get("acceleration_name", "a")
+    window_length = params.get("window_length", 11)
+    polyorder = params.get("polyorder", 2)
     overwrite = params.get("overwrite", False)
 
-    exp = payload["experiments"][exp_id]
-    t = np.array(exp["series"]["t"], dtype=float)
-    q = np.array(exp["series"][source_series], dtype=float)
+    # Validation
+    if window_length < polyorder + 1:
+        raise ValueError(f"window_length ({window_length}) must be > polyorder ({polyorder})")
+    if window_length % 2 == 0:
+        raise ValueError(f"window_length ({window_length}) must be odd")
 
-    # 时间步长（优先使用config中的dt）
-    config = exp.get("config", {})
-    dt = config.get("dt")
-    if dt is None or dt <= 0:
-        dt = t[1] - t[0] if len(t) > 1 else 0.05
+    derived_series = []
+    metrics = {}
+    observations_parts = []
 
-    n = len(t)
-    if n < window_length:
-        raise ValueError(f"序列长度 {n} 小于窗口长度 {window_length}")
+    for exp_id in experiment_ids:
+        if exp_id not in experiments:
+            raise ValueError(f"Experiment {exp_id} not found in payload")
+        exp = experiments[exp_id]
+        config = exp["config"]
+        series = exp["series"]
 
-    # Savitzky-Golay 滤波
-    q_smooth = savgol_filter(q, window_length, polyorder, deriv=0, mode='interp')
-    v = savgol_filter(q, window_length, polyorder, deriv=1, delta=dt, mode='interp')
-    a = savgol_filter(q, window_length, polyorder, deriv=2, delta=dt, mode='interp')
+        if source not in series:
+            raise ValueError(f"Source series '{source}' not found in experiment {exp_id}")
+        if "t" not in series:
+            raise ValueError(f"Time series 't' missing in experiment {exp_id}")
 
-    # 构建派生序列
-    derived_series = [
-        {
+        q = np.array(series[source], dtype=float)
+        t = np.array(series["t"], dtype=float)
+        n = len(q)
+        if n == 0:
+            raise ValueError(f"Empty series '{source}' in experiment {exp_id}")
+        if len(t) != n:
+            raise ValueError(f"Length mismatch between t ({len(t)}) and {source} ({n})")
+
+        # Determine dt
+        if "dt" in config:
+            dt = float(config["dt"])
+        else:
+            dt = float(np.median(np.diff(t)))
+        if dt <= 0:
+            raise ValueError(f"Non-positive dt ({dt}) in experiment {exp_id}")
+
+        # Apply Savitzky-Golay filter
+        try:
+            q_smooth = savgol_filter(q, window_length, polyorder, deriv=0)
+            # Velocity: first derivative, need to divide by dt
+            v = savgol_filter(q, window_length, polyorder, deriv=1) / dt
+            # Acceleration: second derivative, divide by dt**2
+            a = savgol_filter(q, window_length, polyorder, deriv=2) / (dt ** 2)
+        except Exception as e:
+            raise ValueError(f"Savitzky-Golay filter failed for {exp_id}: {e}") from e
+
+        # Build derived series entries
+        # For position series
+        derived_series.append({
             "experiment_id": exp_id,
             "name": pos_name,
             "values": q_smooth.tolist(),
-            "source_name": f"Savitzky-Golay平滑{source_series}(w={window_length}, p={polyorder})",
+            "source_name": f"Savitzky-Golay smoothed {source} (w={window_length}, p={polyorder})",
             "provenance": "generated data processor: estimate_kinematics",
-            "description": f"平滑后的位置序列 (window={window_length}, polyorder={polyorder})"
-        },
-        {
+            "description": f"Smoothed position using SG filter with window={window_length}, polyorder={polyorder}"
+        })
+
+        # For velocity
+        derived_series.append({
             "experiment_id": exp_id,
             "name": vel_name,
             "values": v.tolist(),
-            "source_name": f"Savitzky-Golay一阶导数{source_series}(w={window_length}, p={polyorder})",
+            "source_name": f"Savitzky-Golay 1st derivative of {source} (w={window_length}, p={polyorder})",
             "provenance": "generated data processor: estimate_kinematics",
-            "description": f"估计的速度序列"
-        },
-        {
+            "description": f"Velocity estimated via SG filter derivative"
+        })
+
+        # For acceleration
+        derived_series.append({
             "experiment_id": exp_id,
             "name": acc_name,
             "values": a.tolist(),
-            "source_name": f"Savitzky-Golay二阶导数{source_series}(w={window_length}, p={polyorder})",
+            "source_name": f"Savitzky-Golay 2nd derivative of {source} (w={window_length}, p={polyorder})",
             "provenance": "generated data processor: estimate_kinematics",
-            "description": f"估计的加速度序列"
-        }
-    ]
+            "description": f"Acceleration estimated via SG filter second derivative"
+        })
 
-    # 统计指标
-    metrics = {
-        f"{vel_name}_min": float(np.min(v)),
-        f"{vel_name}_max": float(np.max(v)),
-        f"{vel_name}_mean": float(np.mean(v)),
-        f"{vel_name}_std": float(np.std(v)),
-        f"{acc_name}_min": float(np.min(a)),
-        f"{acc_name}_max": float(np.max(a)),
-        f"{acc_name}_mean": float(np.mean(a)),
-        f"{acc_name}_std": float(np.std(a)),
-        "window_length": window_length,
-        "polyorder": polyorder,
-    }
+        # Compute summary metrics
+        for name, arr in [(pos_name, q_smooth), (vel_name, v), (acc_name, a)]:
+            prefix = f"{exp_id}_{name}"
+            metrics[f"{prefix}_min"] = float(np.min(arr))
+            metrics[f"{prefix}_max"] = float(np.max(arr))
+            metrics[f"{prefix}_mean"] = float(np.mean(arr))
+            metrics[f"{prefix}_std"] = float(np.std(arr, ddof=0))
 
-    # 构建 observation 文本
-    v_min_str = f"{metrics[f'{vel_name}_min']:.6f}"
-    v_max_str = f"{metrics[f'{vel_name}_max']:.6f}"
-    v_mean_str = f"{metrics[f'{vel_name}_mean']:.6f}"
-    v_std_str  = f"{metrics[f'{vel_name}_std']:.6f}"
-    a_min_str = f"{metrics[f'{acc_name}_min']:.6f}"
-    a_max_str = f"{metrics[f'{acc_name}_max']:.6f}"
-    a_mean_str = f"{metrics[f'{acc_name}_mean']:.6f}"
-    a_std_str  = f"{metrics[f'{acc_name}_std']:.6f}"
+        part = (f"实验 {exp_id}: 从原始 {source} 通过 SG 滤波 (窗口 {window_length}, 阶数 {polyorder}) "
+                f"估计 平滑位置 {pos_name}, 速度 {vel_name}, 加速度 {acc_name}。"
+                f"{pos_name}: 最小值 {metrics[f'{exp_id}_{pos_name}_min']:.4f}, 最大值 {metrics[f'{exp_id}_{pos_name}_max']:.4f}; "
+                f"{vel_name}: 最小值 {metrics[f'{exp_id}_{vel_name}_min']:.4f}, 最大值 {metrics[f'{exp_id}_{vel_name}_max']:.4f}; "
+                f"{acc_name}: 最小值 {metrics[f'{exp_id}_{acc_name}_min']:.4f}, 最大值 {metrics[f'{exp_id}_{acc_name}_max']:.4f}。")
+        observations_parts.append(part)
 
-    observation = (
-        f"对实验 {exp_id} 使用 Savitzky-Golay 滤波从 {source_series} 估计运动学参数。\n"
-        f"参数: window_length={window_length}, polyorder={polyorder}.\n"
-        f"平滑后的位置序列 '{pos_name}' 已生成。\n"
-        f"速度 '{vel_name}': min={v_min_str}, max={v_max_str}, mean={v_mean_str}, std={v_std_str}.\n"
-        f"加速度 '{acc_name}': min={a_min_str}, max={a_max_str}, mean={a_mean_str}, std={a_std_str}."
-    )
-
-    # 生成图像
-    output_dir = payload["output_dir"]
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    axes[0].plot(t, q, label='原始 ' + source_series, alpha=0.5, linewidth=1)
-    axes[0].plot(t, q_smooth, label='平滑后 ' + pos_name, linewidth=2)
-    axes[0].set_ylabel('position')
-    axes[0].legend()
-    axes[0].grid(True)
-
-    axes[1].plot(t, v, label=vel_name, color='orange')
-    axes[1].set_ylabel('velocity')
-    axes[1].legend()
-    axes[1].grid(True)
-
-    axes[2].plot(t, a, label=acc_name, color='green')
-    axes[2].set_ylabel('acceleration')
-    axes[2].set_xlabel('time (s)')
-    axes[2].legend()
-    axes[2].grid(True)
-
-    fig.suptitle(f'{exp_id} Kinematic Estimation (window={window_length}, poly={polyorder})')
-    plt.tight_layout()
-    figure_path = os.path.join(output_dir, f"{exp_id}_kinematics.png")
-    plt.savefig(figure_path, dpi=150)
-    plt.close(fig)
-    figures = [figure_path]
+    observation = "运动学估计完成。\n" + "\n".join(observations_parts)
 
     return {
         "observation": observation,
         "derived_series": derived_series,
-        "figures": figures,
+        "figures": [],
         "metrics": metrics
     }
